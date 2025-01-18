@@ -5,9 +5,10 @@ import (
 	"time"
 
 	"github.com/manyminds/api2go/jsonapi"
-	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/sessions"
 )
 
 func TestUserResource(t *testing.T) {
@@ -15,9 +16,11 @@ func TestUserResource(t *testing.T) {
 		ts = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	)
 
-	user := models.User{
+	user := sessions.User{
 		Email:     "notreal@fakeemail.ch",
 		CreatedAt: ts,
+		UpdatedAt: ts,
+		Role:      sessions.UserRoleAdmin,
 	}
 
 	r := NewUserResource(user)
@@ -32,7 +35,10 @@ func TestUserResource(t *testing.T) {
 		   "id": "notreal@fakeemail.ch",
 		   "attributes": {
 			  "email": "notreal@fakeemail.ch",
-			  "createdAt": "2000-01-01T00:00:00Z"
+			  "createdAt": "2000-01-01T00:00:00Z",
+			  "updatedAt": "2000-01-01T00:00:00Z",
+			  "hasActiveApiToken": "false",
+			  "role": "admin"
 		   }
 		}
 	 }

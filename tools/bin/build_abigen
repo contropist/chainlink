@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Checks that the correct abigen is installed in this directory, and installs it
 # if not.
@@ -35,6 +35,7 @@ pushd "$TMPDIR"
 git clone --depth=1 --single-branch --branch "$GETH_VERSION" "$GETH_REPO_URL"
 cd go-ethereum/cmd/abigen
 go build
+rm -f "$THIS_DIR/abigen" # necessary on MacOS for code signing
 cp ./abigen "$THIS_DIR"
 
 popd

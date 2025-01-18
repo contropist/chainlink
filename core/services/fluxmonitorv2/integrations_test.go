@@ -3,37 +3,50 @@ package fluxmonitorv2_test
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/eth/ethconfig"
-
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ethereum/go-ethereum/accounts/abi/bind/backends"
-	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flags_wrapper"
-	faw "github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/link_token_interface"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
-	"github.com/smartcontractkit/chainlink/core/utils"
+	gethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
+
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/tests"
+
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/assets"
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/log"
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/types"
+	evmutils "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/flags_wrapper"
+	faw "github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/flux_aggregator_wrapper"
+	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/link_token_interface"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
+	"github.com/smartcontractkit/chainlink/v2/core/store/models"
+	"github.com/smartcontractkit/chainlink/v2/core/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/utils/testutils/heavyweight"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
 )
 
 const description = "exactly thirty-three characters!!"
@@ -43,34 +56,28 @@ const fee = int64(100) // Amount paid by FA contract, in LINK-wei
 const faTimeout = uint32(1)
 
 var pollTimerPeriod = 200 * time.Millisecond // if failing due to timeouts, increase this
-var oneEth = big.NewInt(1000000000000000000)
 var emptyList = []common.Address{}
+
+func oneEth() *big.Int { return big.NewInt(1000000000000000000) }
 
 // fluxAggregatorUniverse represents the universe with which the aggregator
 // contract interacts
 type fluxAggregatorUniverse struct {
-	key                       models.Key
+	key                       ethkey.KeyV2
 	aggregatorContract        *faw.FluxAggregator
 	aggregatorContractAddress common.Address
 	linkContract              *link_token_interface.LinkToken
 	flagsContract             *flags_wrapper.Flags
 	flagsContractAddress      common.Address
+	evmChainID                big.Int
 	// Abstraction representation of the ethereum blockchain
-	backend       *backends.SimulatedBackend
+	backend       types.Backend
 	aggregatorABI abi.ABI
 	// Cast of participants
 	sergey  *bind.TransactOpts // Owns all the LINK initially
 	neil    *bind.TransactOpts // Node operator Flux Monitor Oracle
 	ned     *bind.TransactOpts // Node operator Flux Monitor Oracle
 	nallory *bind.TransactOpts // Node operator Flux Monitor Oracle running this node
-}
-
-// newIdentity returns a go-ethereum abstraction of an ethereum account for
-// interacting with contract golang wrappers
-func newIdentity(t *testing.T) *bind.TransactOpts {
-	key, err := crypto.GenerateKey()
-	require.NoError(t, err, "failed to generate ethereum identity")
-	return cltest.MustNewSimulatedBackendKeyedTransactor(t, key)
 }
 
 type fluxAggregatorUniverseConfig struct {
@@ -89,6 +96,7 @@ func WithMinMaxSubmission(min, max *big.Int) func(cfg *fluxAggregatorUniverseCon
 // arguments match the arguments of the same name in the FluxAggregator
 // constructor.
 func setupFluxAggregatorUniverse(t *testing.T, configOptions ...func(cfg *fluxAggregatorUniverseConfig)) fluxAggregatorUniverse {
+	tests.SkipShort(t, "VRFCoordinatorV2Universe")
 	cfg := &fluxAggregatorUniverseConfig{
 		MinSubmission: big.NewInt(0),
 		MaxSubmission: big.NewInt(100000000000),
@@ -98,34 +106,35 @@ func setupFluxAggregatorUniverse(t *testing.T, configOptions ...func(cfg *fluxAg
 		optFn(cfg)
 	}
 
-	key := cltest.MustGenerateRandomKey(t)
-	k, err := keystore.DecryptKey(key.JSON.Bytes(), cltest.Password)
+	key, err := ethkey.NewV2()
 	require.NoError(t, err)
-	oracleTransactor := cltest.MustNewSimulatedBackendKeyedTransactor(t, k.PrivateKey)
+	oracleTransactor, err := bind.NewKeyedTransactorWithChainID(key.ToEcdsaPrivKey(), testutils.SimulatedChainID)
+	require.NoError(t, err)
 
 	var f fluxAggregatorUniverse
+	f.evmChainID = *testutils.SimulatedChainID
 	f.key = key
-	f.sergey = newIdentity(t)
-	f.neil = newIdentity(t)
-	f.ned = newIdentity(t)
+	f.sergey = testutils.MustNewSimTransactor(t)
+	f.neil = testutils.MustNewSimTransactor(t)
+	f.ned = testutils.MustNewSimTransactor(t)
 	f.nallory = oracleTransactor
-	genesisData := core.GenesisAlloc{
-		f.sergey.From:  {Balance: oneEth},
-		f.neil.From:    {Balance: oneEth},
-		f.ned.From:     {Balance: oneEth},
-		f.nallory.From: {Balance: oneEth},
+	genesisData := gethtypes.GenesisAlloc{
+		f.sergey.From:  {Balance: assets.Ether(1000).ToInt()},
+		f.neil.From:    {Balance: assets.Ether(1000).ToInt()},
+		f.ned.From:     {Balance: assets.Ether(1000).ToInt()},
+		f.nallory.From: {Balance: assets.Ether(1000).ToInt()},
 	}
 	gasLimit := ethconfig.Defaults.Miner.GasCeil * 2
-	f.backend = backends.NewSimulatedBackend(genesisData, gasLimit)
+	f.backend = cltest.NewSimulatedBackend(t, genesisData, gasLimit)
 
 	f.aggregatorABI, err = abi.JSON(strings.NewReader(faw.FluxAggregatorABI))
 	require.NoError(t, err, "could not parse FluxAggregator ABI")
 
 	var linkAddress common.Address
-	linkAddress, _, f.linkContract, err = link_token_interface.DeployLinkToken(f.sergey, f.backend)
+	linkAddress, _, f.linkContract, err = link_token_interface.DeployLinkToken(f.sergey, f.backend.Client())
 	require.NoError(t, err, "failed to deploy link contract to simulated ethereum blockchain")
 
-	f.flagsContractAddress, _, f.flagsContract, err = flags_wrapper.DeployFlags(f.sergey, f.backend, f.sergey.From)
+	f.flagsContractAddress, _, f.flagsContract, err = flags_wrapper.DeployFlags(f.sergey, f.backend.Client(), f.sergey.From)
 	require.NoError(t, err, "failed to deploy flags contract to simulated ethereum blockchain")
 
 	f.backend.Commit()
@@ -140,7 +149,7 @@ func setupFluxAggregatorUniverse(t *testing.T, configOptions ...func(cfg *fluxAg
 	f.sergey.GasLimit = gasLimit
 	f.aggregatorContractAddress, _, f.aggregatorContract, err = faw.DeployFluxAggregator(
 		f.sergey,
-		f.backend,
+		f.backend.Client(),
 		linkAddress,
 		big.NewInt(fee),
 		faTimeout,
@@ -155,8 +164,9 @@ func setupFluxAggregatorUniverse(t *testing.T, configOptions ...func(cfg *fluxAg
 
 	f.sergey.GasLimit = oldGasLimit
 
-	_, err = f.linkContract.Transfer(f.sergey, f.aggregatorContractAddress, oneEth) // Actually, LINK
+	_, err = f.linkContract.Transfer(f.sergey, f.aggregatorContractAddress, oneEth()) // Actually, LINK
 	require.NoError(t, err, "failed to fund FluxAggregator contract with LINK")
+	f.backend.Commit()
 
 	_, err = f.aggregatorContract.UpdateAvailableFunds(f.sergey)
 	require.NoError(t, err, "failed to update aggregator's availableFunds field")
@@ -164,9 +174,9 @@ func setupFluxAggregatorUniverse(t *testing.T, configOptions ...func(cfg *fluxAg
 	f.backend.Commit()
 	availableFunds, err := f.aggregatorContract.AvailableFunds(nil)
 	require.NoError(t, err, "failed to retrieve AvailableFunds")
-	require.Equal(t, availableFunds, oneEth)
+	require.Equal(t, availableFunds, oneEth())
 
-	ilogs, err := f.aggregatorContract.FilterAvailableFundsUpdated(nil, []*big.Int{oneEth})
+	ilogs, err := f.aggregatorContract.FilterAvailableFundsUpdated(nil, []*big.Int{oneEth()})
 	require.NoError(t, err, "failed to gather AvailableFundsUpdated logs")
 
 	logs := cltest.GetLogs(t, nil, ilogs)
@@ -195,19 +205,14 @@ func (fau fluxAggregatorUniverse) WatchSubmissionReceived(t *testing.T, addresse
 	return submissionReceived
 }
 
-func setupApplication(
+func startApplication(
 	t *testing.T,
 	fa fluxAggregatorUniverse,
-	setConfig func(cfg *orm.Config),
+	overrides func(c *chainlink.Config, s *chainlink.Secrets),
 ) *cltest.TestApplication {
-	config, cfgCleanup := cltest.NewConfig(t)
-	setConfig(config.Config)
-
-	t.Cleanup(cfgCleanup)
-
-	app, cleanup := cltest.NewApplicationWithConfigAndKeyOnSimulatedBlockchain(t, config, fa.backend, fa.key)
-	t.Cleanup(cleanup)
-
+	config, _ := heavyweight.FullTestDBV2(t, overrides)
+	app := cltest.NewApplicationWithConfigV2AndKeyOnSimulatedBlockchain(t, config, fa.backend, fa.key)
+	require.NoError(t, app.Start(testutils.Context(t)))
 	return app
 }
 
@@ -231,9 +236,9 @@ func checkOraclesAdded(t *testing.T, f fluxAggregatorUniverse, oracleList []comm
 	}
 }
 
-func generatePriceResponseFn(price *int64) func() string {
+func generatePriceResponseFn(price func() int64) func() string {
 	return func() string {
-		return fmt.Sprintf(`{"data":{"result": %d}}`, atomic.LoadInt64(price))
+		return fmt.Sprintf(`{"data":{"result": %d}}`, price())
 	}
 }
 
@@ -249,7 +254,9 @@ type answerParams struct {
 func checkSubmission(t *testing.T, p answerParams, currentBalance int64, receiptBlock uint64) {
 	t.Helper()
 	if receiptBlock == 0 {
-		receiptBlock = p.fa.backend.Blockchain().CurrentBlock().Number().Uint64()
+		h, err := p.fa.backend.Client().HeaderByNumber(testutils.Context(t), nil)
+		require.NoError(t, err)
+		receiptBlock = h.Number.Uint64()
 	}
 	blockRange := &bind.FilterOpts{Start: 0, End: &receiptBlock}
 
@@ -320,7 +327,7 @@ func submitAnswer(t *testing.T, p answerParams) {
 	cb := currentBalance(t, p.fa)
 
 	// used to ensure that the simulated backend has processed the submission,
-	// before we search for the log and checek it.
+	// before we search for the log and check it.
 	srCh := make(chan *faw.FluxAggregatorSubmissionReceived)
 	fromBlock := uint64(0)
 	srSubscription, err := p.fa.aggregatorContract.WatchSubmissionReceived(
@@ -346,19 +353,24 @@ func submitAnswer(t *testing.T, p answerParams) {
 	select {
 	case <-srCh:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("failed to complete submission to flux aggregator")
+		t.Fatal("failed to complete submission to flux aggregator")
 	}
 	checkSubmission(t, p, cb.Int64(), 0)
 }
 
-func awaitSubmission(t *testing.T, submissionReceived chan *faw.FluxAggregatorSubmissionReceived) (
+func awaitSubmission(t *testing.T, backend types.Backend, submissionReceived chan *faw.FluxAggregatorSubmissionReceived) (
 	receiptBlock uint64, answer int64,
 ) {
+	t.Helper()
+
+	// Send blocks until we get a response
+	stopBlocks := utils.FiniteTicker(time.Second, func() { backend.Commit() })
+	defer stopBlocks()
 	select { // block until FluxAggregator contract acknowledges chainlink message
 	case log := <-submissionReceived:
 		return log.Raw.BlockNumber, log.Submission.Int64()
 	case <-time.After(20 * pollTimerPeriod):
-		t.Fatalf("chainlink failed to submit answer to FluxAggregator contract")
+		t.Fatal("chainlink failed to submit answer to FluxAggregator contract")
 		return 0, 0 // unreachable
 	}
 }
@@ -369,89 +381,134 @@ func assertNoSubmission(t *testing.T,
 	duration time.Duration,
 	msg string,
 ) {
+	// drain the channel
+	for len(submissionReceived) > 0 {
+		<-submissionReceived
+	}
+
 	select {
 	case <-submissionReceived:
-		assert.Fail(t, "flags are up, but submission was sent")
-	case <-time.After(2 * time.Second):
+		assert.Fail(t, "flags are up, but submission was sent", msg)
+	case <-time.After(duration):
 	}
 }
 
 // assertPipelineRunCreated checks that a pipeline exists for a given round and
 // verifies the answer
-func assertPipelineRunCreated(t *testing.T, db *gorm.DB, roundID int64, result float64) {
+func assertPipelineRunCreated(t *testing.T, ds sqlutil.DataSource, roundID int64, result int64) pipeline.Run {
+	ctx := testutils.Context(t)
 	// Fetch the stats to extract the run id
 	stats := fluxmonitorv2.FluxMonitorRoundStatsV2{}
-	db.Where("round_id = ?", roundID).Find(&stats)
-
+	require.NoError(t, ds.GetContext(ctx, &stats, "SELECT * FROM flux_monitor_round_stats_v2 WHERE round_id = $1", roundID))
+	if stats.ID == 0 {
+		t.Fatalf("Stats for round id: %v not found!", roundID)
+	}
+	require.True(t, stats.PipelineRunID.Valid)
 	// Verify the pipeline run data
 	run := pipeline.Run{}
-	db.Find(&run, stats.PipelineRunID)
+	require.NoError(t, ds.GetContext(ctx, &run, `SELECT * FROM pipeline_runs WHERE id = $1`, stats.PipelineRunID.Int64), "runID %v", stats.PipelineRunID)
 	assert.Equal(t, []interface{}{result}, run.Outputs.Val)
+	return run
+}
+
+func checkLogWasConsumed(t *testing.T, fa fluxAggregatorUniverse, ds sqlutil.DataSource, pipelineSpecID int32, blockNumber uint64) {
+	t.Helper()
+	lggr := logger.TestLogger(t)
+	lggr.Infof("Waiting for log on block: %v, job id: %v", blockNumber, pipelineSpecID)
+
+	g := gomega.NewWithT(t)
+	g.Eventually(func() bool {
+		ctx := testutils.Context(t)
+		block, err := fa.backend.Client().BlockByNumber(ctx, new(big.Int).SetUint64(blockNumber))
+		require.NoError(t, err)
+		require.NotNil(t, block)
+		orm := log.NewORM(ds, fa.evmChainID)
+		consumed, err := orm.WasBroadcastConsumed(ctx, block.Hash(), 0, pipelineSpecID)
+		require.NoError(t, err)
+		fa.backend.Commit()
+		return consumed
+	}, testutils.WaitTimeout(t), time.Second).Should(gomega.BeTrue())
 }
 
 func TestFluxMonitor_Deviation(t *testing.T) {
-	fa := setupFluxAggregatorUniverse(t)
-
-	// - add oracles
-	oracleList := []common.Address{fa.nallory.From}
-	_, err := fa.aggregatorContract.ChangeOracles(fa.sergey, emptyList, oracleList, oracleList, 1, 1, 0)
-	assert.NoError(t, err, "failed to add oracles to aggregator")
-	fa.backend.Commit()
-	checkOraclesAdded(t, fa, oracleList)
-
-	// Set up chainlink app
-	app := setupApplication(t, fa, func(cfg *orm.Config) {
-		cfg.Set("DEFAULT_HTTP_TIMEOUT", "100ms")
-		cfg.Set("TRIGGER_FALLBACK_DB_POLL_INTERVAL", "1s")
-	})
-	require.NoError(t, app.StartAndConnect())
-
-	// Create mock server
-	// We expect metadata of:
-	//  latestAnswer:nil updatedAt:nil // First call
-	//  latestAnswer:100 updatedAt:50
-	//  latestAnswer:103 updatedAt:60
-	type k struct{ latestAnswer, updatedAt string }
-	expectedMeta := map[k]struct{}{
-		{"100", "50"}: {},
-		{"103", "60"}: {},
+	tests := []struct {
+		name    string
+		eip1559 bool
+	}{
+		{"legacy", false},
+		{"eip1559", true},
 	}
-	reportPrice := int64(100)
-	mockServer := cltest.NewHTTPMockServerWithAlterableResponseAndRequest(t,
-		generatePriceResponseFn(&reportPrice),
-		func(r *http.Request) {
-			b, err1 := ioutil.ReadAll(r.Body)
-			require.NoError(t, err1)
-			var m models.BridgeMetaDataJSON
-			require.NoError(t, json.Unmarshal(b, &m))
-			if m.Meta.LatestAnswer != nil && m.Meta.UpdatedAt != nil {
-				delete(expectedMeta, k{m.Meta.LatestAnswer.String(), m.Meta.UpdatedAt.String()})
+
+	for _, tt := range tests {
+		test := tt
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := gomega.NewWithT(t)
+			fa := setupFluxAggregatorUniverse(t)
+
+			// - add oracles
+			oracleList := []common.Address{fa.nallory.From}
+			_, err := fa.aggregatorContract.ChangeOracles(fa.sergey, emptyList, oracleList, oracleList, 1, 1, 0)
+			assert.NoError(t, err, "failed to add oracles to aggregator")
+			fa.backend.Commit()
+			checkOraclesAdded(t, fa, oracleList)
+
+			// Set up chainlink app
+			app := startApplication(t, fa, func(c *chainlink.Config, s *chainlink.Secrets) {
+				c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(100 * time.Millisecond)
+				c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(1 * time.Second)
+				c.EVM[0].GasEstimator.EIP1559DynamicFees = &test.eip1559
+			})
+
+			type v struct {
+				count     int
+				updatedAt int64
 			}
-		},
-	)
-	t.Cleanup(mockServer.Close)
-	u, _ := url.Parse(mockServer.URL)
-	app.Store.CreateBridgeType(&models.BridgeType{
-		Name: "bridge",
-		URL:  models.WebURL(*u),
-	})
+			expectedMeta := map[string]v{}
+			var expMetaMu sync.Mutex
 
-	// When event appears on submissionReceived, flux monitor job run is complete
-	submissionReceived := fa.WatchSubmissionReceived(t,
-		[]common.Address{fa.nallory.From},
-	)
+			var reportPrice atomic.Int64
+			reportPrice.Store(100)
+			mockServer := cltest.NewHTTPMockServerWithAlterableResponseAndRequest(t,
+				generatePriceResponseFn(reportPrice.Load),
+				func(r *http.Request) {
+					b, err1 := io.ReadAll(r.Body)
+					require.NoError(t, err1)
+					var m bridges.BridgeMetaDataJSON
+					require.NoError(t, json.Unmarshal(b, &m))
+					if m.Meta.LatestAnswer != nil && m.Meta.UpdatedAt != nil {
+						k := m.Meta.LatestAnswer.String()
+						expMetaMu.Lock()
+						curr := expectedMeta[k]
+						assert.True(t, m.Meta.UpdatedAt.IsInt64()) // sanity check unix ts
+						expectedMeta[k] = v{curr.count + 1, m.Meta.UpdatedAt.Int64()}
+						expMetaMu.Unlock()
+					}
+				},
+			)
+			t.Cleanup(mockServer.Close)
+			u, _ := url.Parse(mockServer.URL)
+			require.NoError(t, app.BridgeORM().CreateBridgeType(testutils.Context(t), &bridges.BridgeType{
+				Name: "bridge",
+				URL:  models.WebURL(*u),
+			}))
 
-	// Create the job
-	s := `
+			// When event appears on submissionReceived, flux monitor job run is complete
+			submissionReceived := fa.WatchSubmissionReceived(t,
+				[]common.Address{fa.nallory.From},
+			)
+
+			// Create the job
+			s := `
 	type              = "fluxmonitor"
 	schemaVersion     = 1
 	name              = "integration test"
 	contractAddress   = "%s"
-	precision = 0
 	threshold = 2.0
 	absoluteThreshold = 0.0
+	evmChainID        = 1337
 
-	idleTimerPeriod = "1s"
+	idleTimerPeriod = "10s"
 	idleTimerDisabled = false
 
 	pollTimerPeriod = "%s"
@@ -465,63 +522,100 @@ func TestFluxMonitor_Deviation(t *testing.T) {
 	"""
 		`
 
-	s = fmt.Sprintf(s, fa.aggregatorContractAddress, pollTimerPeriod)
+			s = fmt.Sprintf(s, fa.aggregatorContractAddress, 2*time.Second)
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(s),
-	})
-	assert.NoError(t, err)
+			requestBody, err := json.Marshal(web.CreateJobRequest{
+				TOML: s,
+			})
+			assert.NoError(t, err)
 
-	initialBalance := currentBalance(t, &fa).Int64()
+			initialBalance := currentBalance(t, &fa).Int64()
 
-	cltest.CreateJobViaWeb2(t, app, string(requestBody))
+			jobResponse := cltest.CreateJobViaWeb2(t, app, string(requestBody))
+			i, err := strconv.ParseInt(jobResponse.ID, 10, 32)
+			require.NoError(t, err)
+			jobID := int32(i)
 
-	// Initial Poll
-	receiptBlock, answer := awaitSubmission(t, submissionReceived)
+			// Waiting for flux monitor to finish Register process in log broadcaster
+			// and then to have log broadcaster backfill logs after the debounceResubscribe period of ~ 1 sec
+			g.Eventually(func() uint32 {
+				lb := evmtest.MustGetDefaultChain(t, app.GetRelayers().LegacyEVMChains()).LogBroadcaster()
+				return lb.(log.BroadcasterInTest).TrackedAddressesCount()
+			}, testutils.WaitTimeout(t), 200*time.Millisecond).Should(gomega.BeNumerically(">=", 1))
 
-	assert.Equal(t, atomic.LoadInt64(&reportPrice), answer,
-		"failed to report correct price to contract")
-	checkSubmission(t,
-		answerParams{
-			fa:              &fa,
-			roundId:         1,
-			answer:          int64(100),
-			from:            fa.nallory,
-			isNewRound:      true,
-			completesAnswer: true,
-		},
-		initialBalance,
-		receiptBlock,
-	)
-	assertPipelineRunCreated(t, app.Store.DB, 1, float64(100))
+			// Initial Poll
+			receiptBlock, answer := awaitSubmission(t, fa.backend, submissionReceived)
 
-	// Change reported price to a value outside the deviation
-	reportPrice = int64(103)
-	receiptBlock, answer = awaitSubmission(t, submissionReceived)
+			lggr := logger.TestLogger(t)
+			lggr.Infof("Detected submission: %v in block %v", answer, receiptBlock)
 
-	assert.Equal(t, atomic.LoadInt64(&reportPrice), answer,
-		"failed to report correct price to contract")
-	checkSubmission(t,
-		answerParams{
-			fa:              &fa,
-			roundId:         2,
-			answer:          int64(103),
-			from:            fa.nallory,
-			isNewRound:      true,
-			completesAnswer: true,
-		},
-		initialBalance-fee,
-		receiptBlock,
-	)
-	assertPipelineRunCreated(t, app.Store.DB, 2, float64(103))
+			assert.Equal(t, reportPrice.Load(), answer,
+				"failed to report correct price to contract")
 
-	// Should not received a submission as it is inside the deviation
-	reportPrice = int64(104)
-	assertNoSubmission(t, submissionReceived, 2*time.Second, "Should not receive a submission")
-	assert.Len(t, expectedMeta, 0, "expected metadata %v", expectedMeta)
+			checkSubmission(t,
+				answerParams{
+					fa:              &fa,
+					roundId:         1,
+					answer:          int64(100),
+					from:            fa.nallory,
+					isNewRound:      true,
+					completesAnswer: true,
+				},
+				initialBalance,
+				receiptBlock,
+			)
+			assertPipelineRunCreated(t, app.GetDB(), 1, int64(100))
+
+			// Need to wait until NewRound log is consumed - otherwise there is a chance
+			// it will arrive after the next answer is submitted, and cause
+			// DeleteFluxMonitorRoundsBackThrough to delete previous stats
+			checkLogWasConsumed(t, fa, app.GetDB(), jobID, receiptBlock)
+
+			lggr.Info("Updating price to 103")
+			// Change reported price to a value outside the deviation
+			reportPrice.Store(103)
+			receiptBlock, answer = awaitSubmission(t, fa.backend, submissionReceived)
+
+			lggr.Infof("Detected submission: %v in block %v", answer, receiptBlock)
+
+			assert.Equal(t, reportPrice.Load(), answer,
+				"failed to report correct price to contract")
+
+			checkSubmission(t,
+				answerParams{
+					fa:              &fa,
+					roundId:         2,
+					answer:          int64(103),
+					from:            fa.nallory,
+					isNewRound:      true,
+					completesAnswer: true,
+				},
+				initialBalance-fee,
+				receiptBlock,
+			)
+			assertPipelineRunCreated(t, app.GetDB(), 2, int64(103))
+
+			// Need to wait until NewRound log is consumed - otherwise there is a chance
+			// it will arrive after the next answer is submitted, and cause
+			// DeleteFluxMonitorRoundsBackThrough to delete previous stats
+			checkLogWasConsumed(t, fa, app.GetDB(), jobID, receiptBlock)
+
+			// Should not received a submission as it is inside the deviation
+			reportPrice.Store(104)
+			assertNoSubmission(t, submissionReceived, 2*time.Second, "Should not receive a submission")
+
+			expMetaMu.Lock()
+			defer expMetaMu.Unlock()
+			assert.Len(t, expectedMeta, 2, "expected metadata %v", expectedMeta)
+			assert.Greater(t, expectedMeta["100"].count, 0, "Stored answer metadata does not contain 100 but contains: %v", expectedMeta)
+			assert.Greater(t, expectedMeta["103"].count, 0, "Stored answer metadata does not contain 103 but contains: %v", expectedMeta)
+			assert.Greater(t, expectedMeta["103"].updatedAt, expectedMeta["100"].updatedAt)
+		})
+	}
 }
 
 func TestFluxMonitor_NewRound(t *testing.T) {
+	g := gomega.NewWithT(t)
 	fa := setupFluxAggregatorUniverse(t)
 
 	// - add oracles
@@ -532,19 +626,20 @@ func TestFluxMonitor_NewRound(t *testing.T) {
 	checkOraclesAdded(t, fa, oracleList)
 
 	// Set up chainlink app
-	app := setupApplication(t, fa, func(cfg *orm.Config) {
-		cfg.Set("DEFAULT_HTTP_TIMEOUT", "100ms")
-		cfg.Set("FLAGS_CONTRACT_ADDRESS", fa.flagsContractAddress.Hex())
-		cfg.Set("TRIGGER_FALLBACK_DB_POLL_INTERVAL", "1s")
+	app := startApplication(t, fa, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(100 * time.Millisecond)
+		c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(1 * time.Second)
+		flags := types.EIP55AddressFromAddress(fa.flagsContractAddress)
+		c.EVM[0].FlagsContractAddress = &flags
 	})
-	require.NoError(t, app.StartAndConnect())
 
 	initialBalance := currentBalance(t, &fa).Int64()
 
 	// Create mock server
-	reportPrice := int64(1)
+	var reportPrice atomic.Int64
+	reportPrice.Store(1)
 	mockServer := cltest.NewHTTPMockServerWithAlterableResponse(t,
-		generatePriceResponseFn(&reportPrice),
+		generatePriceResponseFn(reportPrice.Load),
 	)
 	t.Cleanup(mockServer.Close)
 
@@ -559,7 +654,7 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = 2
+evmChainID  	  = "%s"
 threshold = 0.5
 absoluteThreshold = 0.0
 
@@ -577,21 +672,30 @@ ds1 -> ds1_parse
 """
 	`
 
-	s = fmt.Sprintf(s, fa.aggregatorContractAddress, pollTimerPeriod, mockServer.URL)
+	s = fmt.Sprintf(s, fa.aggregatorContractAddress, testutils.SimulatedChainID.String(), pollTimerPeriod, mockServer.URL)
 
 	// raise flags to disable polling
-	fa.flagsContract.RaiseFlag(fa.sergey, utils.ZeroAddress) // global kill switch
-	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, evmutils.ZeroAddress) // global kill switch
+	require.NoError(t, err)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	require.NoError(t, err)
 	fa.backend.Commit()
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(s),
+	requestBody, err := json.Marshal(web.CreateJobRequest{
+		TOML: s,
 	})
 	assert.NoError(t, err)
 
 	cltest.CreateJobViaWeb2(t, app, string(requestBody))
 
-	// Have the the fake node start a new round
+	// Waiting for flux monitor to finish Register process in log broadcaster
+	// and then to have log broadcaster backfill logs after the debounceResubscribe period of ~ 1 sec
+	g.Eventually(func() uint32 {
+		lb := evmtest.MustGetDefaultChain(t, app.GetRelayers().LegacyEVMChains()).LogBroadcaster()
+		return lb.(log.BroadcasterInTest).TrackedAddressesCount()
+	}, testutils.WaitTimeout(t), 200*time.Millisecond).Should(gomega.BeNumerically(">=", 2))
+
+	// Have the fake node start a new round
 	submitAnswer(t, answerParams{
 		fa:              &fa,
 		roundId:         1,
@@ -601,9 +705,12 @@ ds1 -> ds1_parse
 		completesAnswer: false,
 	})
 
+	// Finally, the logs from log broadcaster are sent only after a next block is received.
+	fa.backend.Commit()
+
 	// Wait for the node's submission, and ensure it submits to the round
 	// started by the fake node
-	receiptBlock, _ := awaitSubmission(t, submissionReceived)
+	receiptBlock, _ := awaitSubmission(t, fa.backend, submissionReceived)
 	checkSubmission(t,
 		answerParams{
 			fa:              &fa,
@@ -619,6 +726,7 @@ ds1 -> ds1_parse
 }
 
 func TestFluxMonitor_HibernationMode(t *testing.T) {
+	g := gomega.NewWithT(t)
 	fa := setupFluxAggregatorUniverse(t)
 
 	// - add oracles
@@ -628,18 +736,19 @@ func TestFluxMonitor_HibernationMode(t *testing.T) {
 	fa.backend.Commit()
 	checkOraclesAdded(t, fa, oracleList)
 
-	// Set up chainlink app
-	app := setupApplication(t, fa, func(cfg *orm.Config) {
-		cfg.Set("DEFAULT_HTTP_TIMEOUT", "100ms")
-		cfg.Set("FLAGS_CONTRACT_ADDRESS", fa.flagsContractAddress.Hex())
-		cfg.Set("TRIGGER_FALLBACK_DB_POLL_INTERVAL", "1s")
+	// Start chainlink app
+	app := startApplication(t, fa, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(100 * time.Millisecond)
+		c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(1 * time.Second)
+		flags := types.EIP55AddressFromAddress(fa.flagsContractAddress)
+		c.EVM[0].FlagsContractAddress = &flags
 	})
-	require.NoError(t, app.StartAndConnect())
 
 	// Create mock server
-	reportPrice := int64(1)
+	var reportPrice atomic.Int64
+	reportPrice.Store(1)
 	mockServer := cltest.NewHTTPMockServerWithAlterableResponse(t,
-		generatePriceResponseFn(&reportPrice),
+		generatePriceResponseFn(reportPrice.Load),
 	)
 	t.Cleanup(mockServer.Close)
 
@@ -654,7 +763,7 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = 0
+evmChainID        = "%s"
 threshold = 0.5
 absoluteThreshold = 0.0
 
@@ -672,15 +781,18 @@ ds1 -> ds1_parse
 """
 	`
 
-	s = fmt.Sprintf(s, fa.aggregatorContractAddress, "1000ms", mockServer.URL)
+	s = fmt.Sprintf(s, fa.aggregatorContractAddress, testutils.SimulatedChainID.String(), "1000ms", mockServer.URL)
 
 	// raise flags
-	fa.flagsContract.RaiseFlag(fa.sergey, utils.ZeroAddress) // global kill switch
-	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, evmutils.ZeroAddress) // global kill switch
+	require.NoError(t, err)
+
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	require.NoError(t, err)
 	fa.backend.Commit()
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(s),
+	requestBody, err := json.Marshal(web.CreateJobRequest{
+		TOML: s,
 	})
 	assert.NoError(t, err)
 
@@ -688,42 +800,45 @@ ds1 -> ds1_parse
 
 	// node doesn't submit initial response, because flag is up
 	// Wait here so the next lower flags doesn't trigger immediately
-	cltest.AssertPipelineRunsStays(t, j.PipelineSpec.ID, app.Store, 0)
+	cltest.AssertPipelineRunsStays(t, j.PipelineSpec.ID, app.GetDB(), 0)
 
 	// lower global kill switch flag - should trigger job run
-	fa.flagsContract.LowerFlags(fa.sergey, []common.Address{utils.ZeroAddress})
+	_, err = fa.flagsContract.LowerFlags(fa.sergey, []common.Address{evmutils.ZeroAddress})
+	require.NoError(t, err)
 	fa.backend.Commit()
-	awaitSubmission(t, submissionReceived)
+	awaitSubmission(t, fa.backend, submissionReceived)
 
-	reportPrice = int64(2) // change in price should trigger run
-	awaitSubmission(t, submissionReceived)
+	reportPrice.Store(2) // change in price should trigger run
+	awaitSubmission(t, fa.backend, submissionReceived)
 
-	// lower contract's flag - should have no effect (but currently does)
-	// TODO - https://www.pivotaltracker.com/story/show/175419789
-	fa.flagsContract.LowerFlags(fa.sergey, []common.Address{fa.aggregatorContractAddress})
+	// lower contract's flag - should have no effect
+	_, err = fa.flagsContract.LowerFlags(fa.sergey, []common.Address{fa.aggregatorContractAddress})
+	require.NoError(t, err)
 	fa.backend.Commit()
-	awaitSubmission(t, submissionReceived)
+	assertNoSubmission(t, submissionReceived, 5*pollTimerPeriod, "should not trigger a new run because FM is already hibernating")
 
 	// change in price should trigger run
-	reportPrice = int64(4)
-	awaitSubmission(t, submissionReceived)
+	reportPrice.Store(4)
+	awaitSubmission(t, fa.backend, submissionReceived)
 
 	// raise both flags
-	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
-	fa.flagsContract.RaiseFlag(fa.sergey, utils.ZeroAddress)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	require.NoError(t, err)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, evmutils.ZeroAddress)
+	require.NoError(t, err)
 	fa.backend.Commit()
 
 	// wait for FM to receive flags raised logs
-	assert.Eventually(t, func() bool {
+	g.Eventually(func() int {
 		ilogs, err := fa.flagsContract.FilterFlagRaised(nil, []common.Address{})
 		require.NoError(t, err)
 		logs := cltest.GetLogs(t, nil, ilogs)
-		return len(logs) == 4
-	}, 7*time.Second, 100*time.Millisecond)
+		return len(logs)
+	}, testutils.WaitTimeout(t), 100*time.Millisecond).Should(gomega.Equal(4))
 
 	// change in price should not trigger run
-	reportPrice = int64(8)
-	assertNoSubmission(t, submissionReceived, 5*time.Second, "should not trigger a new run, while flag is raised")
+	reportPrice.Store(8)
+	assertNoSubmission(t, submissionReceived, 5*pollTimerPeriod, "should not trigger a new run, while flag is raised")
 }
 
 func TestFluxMonitor_InvalidSubmission(t *testing.T) {
@@ -739,20 +854,17 @@ func TestFluxMonitor_InvalidSubmission(t *testing.T) {
 	fa.backend.Commit()
 
 	// Set up chainlink app
-	app := setupApplication(t, fa, func(cfg *orm.Config) {
-		cfg.Set("DEFAULT_HTTP_TIMEOUT", "100ms")
-		cfg.Set("TRIGGER_FALLBACK_DB_POLL_INTERVAL", "1s")
-		cfg.Set("MIN_OUTGOING_CONFIRMATIONS", "2")
-		cfg.Set("MIN_OUTGOING_CONFIRMATIONS", "2")
-		cfg.Set("ETH_HEAD_TRACKER_MAX_BUFFER_SIZE", "100")
+	app := startApplication(t, fa, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(100 * time.Millisecond)
+		c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(1 * time.Second)
 	})
-	require.NoError(t, app.StartAndConnect())
 
 	// Report a price that is above the maximum allowed value,
 	// causing it to revert.
-	reportPrice := int64(10001) // 10001 ETH/USD price is outside the range.
+	var reportPrice atomic.Int64
+	reportPrice.Store(10001) // 10001 ETH/USD price is outside the range.
 	mockServer := cltest.NewHTTPMockServerWithAlterableResponse(t,
-		generatePriceResponseFn(&reportPrice),
+		generatePriceResponseFn(reportPrice.Load),
 	)
 	t.Cleanup(mockServer.Close)
 
@@ -762,7 +874,7 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = %d
+evmChainID		  = "%s"
 threshold = 0.5
 absoluteThreshold = 0.01
 
@@ -780,28 +892,30 @@ ds1 -> ds1_parse
 """
 `
 
-	s := fmt.Sprintf(toml, fa.aggregatorContractAddress, 8, "100ms", mockServer.URL)
+	s := fmt.Sprintf(toml, fa.aggregatorContractAddress, testutils.SimulatedChainID.String(), "100ms", mockServer.URL)
 
 	// raise flags
-	fa.flagsContract.RaiseFlag(fa.sergey, utils.ZeroAddress) // global kill switch
-	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, evmutils.ZeroAddress) // global kill switch
+	require.NoError(t, err)
+	_, err = fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
+	require.NoError(t, err)
 	fa.backend.Commit()
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(s),
+	requestBody, err := json.Marshal(web.CreateJobRequest{
+		TOML: s,
 	})
 	assert.NoError(t, err)
 
 	j := cltest.CreateJobViaWeb2(t, app, string(requestBody))
 
-	closer := cltest.Mine(fa.backend, 500*time.Millisecond)
+	_, closer := cltest.Mine(fa.backend, 500*time.Millisecond)
 	defer closer()
 
 	// We should see a spec error because the value is too large to submit on-chain.
 	jobID, err := strconv.ParseInt(j.ID, 10, 32)
 	require.NoError(t, err)
 
-	jse := cltest.WaitForSpecErrorV2(t, app.Store, int32(jobID), 1)
+	jse := cltest.WaitForSpecErrorV2(t, app.GetDB(), int32(jobID), 1)
 	assert.Contains(t, jse[0].Description, "Answer is outside acceptable range")
 }
 
@@ -817,16 +931,10 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 	checkOraclesAdded(t, fa, oracleList)
 
 	// Set up chainlink app
-	app := setupApplication(t, fa, func(cfg *orm.Config) {
-		cfg.Set("DEFAULT_HTTP_TIMEOUT", "100ms")
-		cfg.Set("TRIGGER_FALLBACK_DB_POLL_INTERVAL", "1s")
+	app := startApplication(t, fa, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.JobPipeline.HTTPRequest.DefaultTimeout = commonconfig.MustNewDuration(100 * time.Millisecond)
+		c.Database.Listener.FallbackPollInterval = commonconfig.MustNewDuration(1 * time.Second)
 	})
-	require.NoError(t, app.StartAndConnect())
-
-	minFee := app.Store.Config.MinimumContractPayment().ToInt().Int64()
-	require.Equal(t, fee, minFee, "fee paid by FluxAggregator (%d) must at "+
-		"least match MinimumContractPayment (%s). (Which is currently set in "+
-		"cltest.go.)", fee, minFee)
 
 	answer := int64(1) // Answer the nodes give on the first round
 
@@ -848,9 +956,10 @@ func TestFluxMonitorAntiSpamLogic(t *testing.T) {
 	// The initial balance is the LINK balance of flux aggregator contract. We
 	// use it to check that the fee for submitting an answer has been paid out.
 	initialBalance := currentBalance(t, &fa).Int64()
-	reportPrice := answer
+	var reportPrice atomic.Int64
+	reportPrice.Store(answer)
 	priceResponse := func() string {
-		return fmt.Sprintf(`{"data":{"result": %d}}`, atomic.LoadInt64(&reportPrice))
+		return fmt.Sprintf(`{"data":{"result": %d}}`, reportPrice.Load())
 	}
 	mockServer := cltest.NewHTTPMockServerWithAlterableResponse(t, priceResponse)
 	t.Cleanup(mockServer.Close)
@@ -867,7 +976,7 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = 2
+evmChainID		  = "%s"
 threshold = 0.5
 absoluteThreshold = 0.0
 
@@ -886,17 +995,17 @@ ds1 -> ds1_parse -> ds1_multiply
 """
 	`
 
-	s = fmt.Sprintf(s, fa.aggregatorContractAddress, "200ms", mockServer.URL)
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(s),
+	s = fmt.Sprintf(s, fa.aggregatorContractAddress, testutils.SimulatedChainID.String(), "200ms", mockServer.URL)
+	requestBody, err := json.Marshal(web.CreateJobRequest{
+		TOML: s,
 	})
 	assert.NoError(t, err)
 
 	cltest.CreateJobViaWeb2(t, app, string(requestBody))
 
-	receiptBlock, answer := awaitSubmission(t, submissionReceived)
+	receiptBlock, answer := awaitSubmission(t, fa.backend, submissionReceived)
 
-	assert.Equal(t, 100*atomic.LoadInt64(&reportPrice), answer,
+	assert.Equal(t, 100*reportPrice.Load(), answer,
 		"failed to report correct price to contract")
 	checkSubmission(t,
 		answerParams{
@@ -913,11 +1022,11 @@ ds1 -> ds1_parse -> ds1_multiply
 	//- have the malicious node start the next round.
 	nextRoundBalance := initialBalance - fee
 	// Triggers a new round, since price deviation exceeds threshold
-	atomic.StoreInt64(&reportPrice, answer+1)
+	reportPrice.Store(answer + 1)
 
-	receiptBlock, _ = awaitSubmission(t, submissionReceived)
+	receiptBlock, _ = awaitSubmission(t, fa.backend, submissionReceived)
 	newRound := roundId + 1
-	processedAnswer = 100 * atomic.LoadInt64(&reportPrice)
+	processedAnswer = 100 * reportPrice.Load()
 	checkSubmission(t,
 		answerParams{
 			fa:              &fa,
@@ -944,7 +1053,7 @@ ds1 -> ds1_parse -> ds1_multiply
 	// Have the malicious node try to start another round. It should not pass as
 	// restartDelay has not been reached.
 	newRound = newRound + 1
-	processedAnswer = 100 * atomic.LoadInt64(&reportPrice)
+	processedAnswer = 100 * reportPrice.Load()
 
 	submitMaliciousAnswer(t,
 		answerParams{
@@ -963,7 +1072,7 @@ ds1 -> ds1_parse -> ds1_multiply
 	assert.Error(t, err, "FA allowed chainlink node to start a new round early")
 
 	//- finally, ensure it can start a legitimate round after restartDelay is
-	//reached start an intervening round
+	// reached start an intervening round
 	submitAnswer(t, answerParams{fa: &fa, roundId: newRound,
 		answer: processedAnswer, from: fa.ned, isNewRound: true,
 		completesAnswer: false})
@@ -972,11 +1081,11 @@ ds1 -> ds1_parse -> ds1_multiply
 		completesAnswer: true})
 
 	// start a legitimate new round
-	atomic.StoreInt64(&reportPrice, reportPrice+3)
+	reportPrice.Add(3)
 
 	// Wait for the node's submission, and ensure it submits to the round
 	// started by the fake node
-	awaitSubmission(t, submissionReceived)
+	awaitSubmission(t, fa.backend, submissionReceived)
 }
 
 // submitMaliciousAnswer simulates a call to fa's FluxAggregator contract from

@@ -1,36 +1,47 @@
 package keeper
 
 import (
+	"strings"
+
+	"github.com/google/uuid"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
+
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
 )
 
+// ValidatedKeeperSpec analyses the tomlString passed as parameter and
+// returns a newly-created Job if there are no validation errors inside the toml.
 func ValidatedKeeperSpec(tomlString string) (job.Job, error) {
+	// Create a new job with a randomly generated uuid, which can be replaced with the one from tomlString.
 	var j = job.Job{
-		Pipeline: *pipeline.NewTaskDAG(),
+		ExternalJobID: uuid.New(),
 	}
-	var spec job.KeeperSpec
+
 	tree, err := toml.Load(tomlString)
 	if err != nil {
 		return j, err
 	}
-	err = tree.Unmarshal(&j)
-	if err != nil {
+
+	if err := tree.Unmarshal(&j); err != nil {
 		return j, err
 	}
-	err = tree.Unmarshal(&spec)
-	if err != nil {
+
+	var spec job.KeeperSpec
+	if err := tree.Unmarshal(&spec); err != nil {
 		return j, err
 	}
+
 	j.KeeperSpec = &spec
 
 	if j.Type != job.Keeper {
 		return j, errors.Errorf("unsupported type %s", j.Type)
 	}
-	if j.SchemaVersion != uint32(1) {
-		return j, errors.Errorf("the only supported schema version is currently 1, got %d", j.SchemaVersion)
+
+	if strings.Contains(tomlString, "observationSource") ||
+		strings.Contains(tomlString, "ObservationSource") {
+		return j, errors.New("There should be no 'observationSource' parameter included in the toml")
 	}
+
 	return j, nil
 }

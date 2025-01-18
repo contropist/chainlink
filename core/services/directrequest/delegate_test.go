@@ -7,113 +7,124 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/gofrs/uuid"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/oracle_wrapper"
-	"github.com/smartcontractkit/chainlink/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/core/services"
-	"github.com/smartcontractkit/chainlink/core/services/directrequest"
-	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/log"
-	log_mocks "github.com/smartcontractkit/chainlink/core/services/log/mocks"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	pipeline_mocks "github.com/smartcontractkit/chainlink/core/services/pipeline/mocks"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/assets"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/mailbox/mailboxtest"
+
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/log"
+	log_mocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/log/mocks"
+	ubig "github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink/v2/core/gethwrappers/generated/operator_wrapper"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/directrequest"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
+	pipeline_mocks "github.com/smartcontractkit/chainlink/v2/core/services/pipeline/mocks"
 )
 
 func TestDelegate_ServicesForSpec(t *testing.T) {
-	gethClient := new(mocks.Client)
-	broadcaster := new(log_mocks.Broadcaster)
-	headBroadcaster := services.NewHeadBroadcaster()
-	runner := new(pipeline_mocks.Runner)
+	ethClient := evmtest.NewEthClientMockWithDefaultChain(t)
+	runner := pipeline_mocks.NewRunner(t)
+	db := pgtest.NewSqlxDB(t)
+	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.EVM[0].MinIncomingConfirmations = ptr[uint32](1)
+	})
+	keyStore := cltest.NewKeyStore(t, db)
+	mailMon := servicetest.Run(t, mailboxtest.NewMonitor(t))
+	legacyChains := evmtest.NewLegacyChains(t, evmtest.TestChainOpts{DB: db, GeneralConfig: cfg, Client: ethClient, MailMon: mailMon, KeyStore: keyStore.Eth()})
 
-	_, orm, cleanupDB := cltest.BootstrapThrowawayORM(t, "event_broadcaster", true)
-	defer cleanupDB()
-
-	config := testConfig{
-		minRequiredOutgoingConfirmations: 1,
-	}
-	delegate := directrequest.NewDelegate(broadcaster, headBroadcaster, runner, nil, gethClient, orm.DB, config)
+	lggr := logger.TestLogger(t)
+	delegate := directrequest.NewDelegate(lggr, runner, nil, legacyChains, mailMon)
 
 	t.Run("Spec without DirectRequestSpec", func(t *testing.T) {
 		spec := job.Job{}
-		_, err := delegate.ServicesForSpec(spec)
+		_, err := delegate.ServicesForSpec(testutils.Context(t), spec)
 		assert.Error(t, err, "expects a *job.DirectRequestSpec to be present")
 	})
 
 	t.Run("Spec with DirectRequestSpec", func(t *testing.T) {
-		spec := job.Job{DirectRequestSpec: &job.DirectRequestSpec{}, PipelineSpec: &pipeline.Spec{}}
-		services, err := delegate.ServicesForSpec(spec)
+		spec := job.Job{DirectRequestSpec: &job.DirectRequestSpec{EVMChainID: (*ubig.Big)(testutils.FixtureChainID)}, PipelineSpec: &pipeline.Spec{}}
+		services, err := delegate.ServicesForSpec(testutils.Context(t), spec)
 		require.NoError(t, err)
 		assert.Len(t, services, 1)
 	})
 }
 
 type DirectRequestUniverse struct {
-	spec              *job.Job
-	runner            *pipeline_mocks.Runner
-	service           job.Service
-	jobORM            job.ORM
-	listener          log.Listener
-	headBroadcastable services.HeadBroadcastable
-	logBroadcaster    *log_mocks.Broadcaster
-	cleanup           func()
+	spec           *job.Job
+	runner         *pipeline_mocks.Runner
+	service        job.ServiceCtx
+	jobORM         job.ORM
+	listener       log.Listener
+	logBroadcaster *log_mocks.Broadcaster
+	cleanup        func()
 }
 
-func NewDirectRequestUniverse(t *testing.T) *DirectRequestUniverse {
-	gethClient := new(mocks.Client)
-	broadcaster := new(log_mocks.Broadcaster)
-	headBroadcaster := services.NewHeadBroadcaster()
-	runner := new(pipeline_mocks.Runner)
+func NewDirectRequestUniverseWithConfig(t *testing.T, cfg chainlink.GeneralConfig, specF func(spec *job.Job)) *DirectRequestUniverse {
+	ethClient := evmtest.NewEthClientMockWithDefaultChain(t)
+	broadcaster := log_mocks.NewBroadcaster(t)
+	runner := pipeline_mocks.NewRunner(t)
+	broadcaster.On("AddDependents", 1)
 
-	config, oldORM, cleanupDB := cltest.BootstrapThrowawayORM(t, "delegate_services_listener_handlelog", true, true)
-	db := oldORM.DB
+	mailMon := servicetest.Run(t, mailboxtest.NewMonitor(t))
 
-	orm, eventBroadcaster, cleanupPipeline := cltest.NewPipelineORM(t, config, db)
+	db := pgtest.NewSqlxDB(t)
+	keyStore := cltest.NewKeyStore(t, db)
+	legacyChains := evmtest.NewLegacyChains(t, evmtest.TestChainOpts{DB: db, GeneralConfig: cfg, Client: ethClient, LogBroadcaster: broadcaster, MailMon: mailMon, KeyStore: keyStore.Eth()})
+	lggr := logger.TestLogger(t)
+	orm := pipeline.NewORM(db, lggr, cfg.JobPipeline().MaxSuccessfulRuns())
+	btORM := bridges.NewORM(db)
+	jobORM := job.NewORM(db, orm, btORM, keyStore, lggr)
+	delegate := directrequest.NewDelegate(lggr, runner, orm, legacyChains, mailMon)
 
-	jobORM := job.NewORM(db, config.Config, orm, eventBroadcaster, &postgres.NullAdvisoryLocker{})
-
-	cleanup := func() {
-		cleanupDB()
-		cleanupPipeline()
-		jobORM.Close()
+	jb := cltest.MakeDirectRequestJobSpec(t)
+	jb.ExternalJobID = uuid.New()
+	if specF != nil {
+		specF(jb)
 	}
-
-	drConfig := testConfig{
-		minRequiredOutgoingConfirmations: 1,
-	}
-	delegate := directrequest.NewDelegate(broadcaster, headBroadcaster, runner, orm, gethClient, db, drConfig)
-
-	spec := factoryJobSpec(t)
-	err := jobORM.CreateJob(context.Background(), spec, spec.Pipeline)
-	require.NoError(t, err)
-	serviceArray, err := delegate.ServicesForSpec(*spec)
+	ctx := testutils.Context(t)
+	require.NoError(t, jobORM.CreateJob(ctx, jb))
+	serviceArray, err := delegate.ServicesForSpec(ctx, *jb)
 	require.NoError(t, err)
 	assert.Len(t, serviceArray, 1)
 	service := serviceArray[0]
-	headBroadcastable := service.(services.HeadBroadcastable)
 
 	uni := &DirectRequestUniverse{
-		spec:              spec,
-		runner:            runner,
-		service:           service,
-		jobORM:            jobORM,
-		listener:          nil,
-		headBroadcastable: headBroadcastable,
-		logBroadcaster:    broadcaster,
-		cleanup:           cleanup,
+		spec:           jb,
+		runner:         runner,
+		service:        service,
+		jobORM:         jobORM,
+		listener:       nil,
+		logBroadcaster: broadcaster,
+		cleanup:        func() { jobORM.Close() },
 	}
 
-	broadcaster.On("Register", mock.Anything, mock.Anything).Return(true, func() {}).Run(func(args mock.Arguments) {
+	broadcaster.On("Register", mock.Anything, mock.Anything).Return(func() {}).Run(func(args mock.Arguments) {
 		uni.listener = args.Get(0).(log.Listener)
 	})
 
 	return uni
+}
+
+func NewDirectRequestUniverse(t *testing.T) *DirectRequestUniverse {
+	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.EVM[0].MinIncomingConfirmations = ptr[uint32](1)
+	})
+	return NewDirectRequestUniverseWithConfig(t, cfg, nil)
 }
 
 func (uni *DirectRequestUniverse) Cleanup() {
@@ -121,117 +132,133 @@ func (uni *DirectRequestUniverse) Cleanup() {
 }
 
 func TestDelegate_ServicesListenerHandleLog(t *testing.T) {
+	testutils.SkipShortDB(t)
+	t.Parallel()
 
 	t.Run("Log is an OracleRequest", func(t *testing.T) {
 		uni := NewDirectRequestUniverse(t)
 		defer uni.Cleanup()
 
-		log := new(log_mocks.Broadcast)
-		defer log.AssertExpectations(t)
+		log := log_mocks.NewBroadcast(t)
+		log.On("ReceiptsRoot").Return(common.Hash{})
+		log.On("TransactionsRoot").Return(common.Hash{})
+		log.On("StateRoot").Return(common.Hash{})
+		log.On("EVMChainID").Return(*big.NewInt(0))
 
-		log.On("WasAlreadyConsumed").Return(false, nil)
-		logOracleRequest := oracle_wrapper.OracleOracleRequest{
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
 			CancelExpiration: big.NewInt(0),
 		}
-		log.On("RawLog").Return(models.Log{
+		log.On("RawLog").Return(types.Log{
 			Topics: []common.Hash{
-				common.Hash{},
-				uni.spec.DirectRequestSpec.OnChainJobSpecID,
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
 			},
 		})
 		log.On("DecodedLog").Return(&logOracleRequest)
-		log.On("MarkConsumed").Return(nil)
+		log.On("String").Return("")
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		runBeganAwaiter := cltest.NewAwaiter()
-		uni.runner.On("ExecuteAndInsertNewRun", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-			runBeganAwaiter.ItHappened()
-		}).Once().Return(int64(0), pipeline.FinalResult{}, nil)
+		uni.runner.On("Run", mock.Anything, mock.AnythingOfType("*pipeline.Run"), mock.Anything, mock.Anything).
+			Return(false, nil).
+			Run(func(args mock.Arguments) {
+				runBeganAwaiter.ItHappened()
+				fn := args.Get(3).(func(source sqlutil.DataSource) error)
+				require.NoError(t, fn(nil))
+			}).Once()
 
-		err := uni.service.Start()
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
 		require.NoError(t, err)
 
+		require.NotNil(t, uni.listener, "listener was nil; expected broadcaster.Register to have been called")
 		// check if the job exists under the correct ID
-		drJob, jErr := uni.jobORM.FindJob(uni.listener.JobIDV2())
+		drJob, jErr := uni.jobORM.FindJob(ctx, uni.listener.JobID())
 		require.NoError(t, jErr)
-		require.Equal(t, drJob.ID, uni.listener.JobIDV2())
+		require.Equal(t, drJob.ID, uni.listener.JobID())
 		require.NotNil(t, drJob.DirectRequestSpec)
 
-		uni.listener.HandleLog(log)
-
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 10})
+		uni.listener.HandleLog(ctx, log)
 
 		runBeganAwaiter.AwaitOrFail(t, 5*time.Second)
 
 		uni.service.Close()
-		uni.logBroadcaster.AssertExpectations(t)
-		uni.runner.AssertExpectations(t)
 	})
 
 	t.Run("Log is not consumed, as it's too young", func(t *testing.T) {
 		uni := NewDirectRequestUniverse(t)
 		defer uni.Cleanup()
 
-		log := new(log_mocks.Broadcast)
+		log := log_mocks.NewBroadcast(t)
 
-		log.On("WasAlreadyConsumed").Return(false, nil).Maybe()
-		logOracleRequest := oracle_wrapper.OracleOracleRequest{
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
 			CancelExpiration: big.NewInt(0),
 		}
-		log.On("RawLog").Return(models.Log{
+		log.On("RawLog").Return(types.Log{
 			Topics: []common.Hash{
-				common.Hash{},
-				uni.spec.DirectRequestSpec.OnChainJobSpecID,
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
 			},
 			BlockNumber: 0,
 		}).Maybe()
 		log.On("DecodedLog").Return(&logOracleRequest).Maybe()
-		log.On("MarkConsumed").Return(nil).Maybe()
+		log.On("String").Return("")
+		log.On("EVMChainID").Return(*big.NewInt(0))
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 
-		err := uni.service.Start()
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
 		require.NoError(t, err)
 
-		uni.listener.HandleLog(log)
+		uni.listener.HandleLog(ctx, log)
 
-		// the log should not be received after this call
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 0})
-		log.AssertExpectations(t)
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
 
-		log.On("WasAlreadyConsumed").Return(false, nil)
+		log.On("ReceiptsRoot").Return(common.Hash{})
+		log.On("TransactionsRoot").Return(common.Hash{})
+		log.On("StateRoot").Return(common.Hash{})
+
 		runBeganAwaiter := cltest.NewAwaiter()
-		uni.runner.On("ExecuteAndInsertNewRun", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-			runBeganAwaiter.ItHappened()
-		}).Once().Return(int64(0), pipeline.FinalResult{}, nil)
+		uni.runner.On("Run", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				runBeganAwaiter.ItHappened()
+				fn := args.Get(3).(func(sqlutil.DataSource) error)
+				require.NoError(t, fn(nil))
+			}).Once().Return(false, nil)
 
 		// but should after this one, as the head Number is larger
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 2})
 		runBeganAwaiter.AwaitOrFail(t, 5*time.Second)
-		cltest.EventuallyExpectationsMet(t, log, 3*time.Second, 100*time.Millisecond)
 
 		uni.service.Close()
-		uni.logBroadcaster.AssertExpectations(t)
-		uni.runner.AssertExpectations(t)
 	})
 
 	t.Run("Log has wrong jobID", func(t *testing.T) {
 		uni := NewDirectRequestUniverse(t)
 		defer uni.Cleanup()
 
-		log := new(log_mocks.Broadcast)
+		log := log_mocks.NewBroadcast(t)
+		lbAwaiter := cltest.NewAwaiter()
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) { lbAwaiter.ItHappened() }).Return(nil)
 
-		log.On("WasAlreadyConsumed").Return(false, nil)
-		log.On("RawLog").Return(models.Log{
-			Topics: []common.Hash{common.Hash{}, common.Hash{}},
+		logCancelOracleRequest := operator_wrapper.OperatorCancelOracleRequest{RequestId: uni.spec.ExternalIDEncodeStringToTopic()}
+		logAwaiter := cltest.NewAwaiter()
+		log.On("DecodedLog").Run(func(args mock.Arguments) { logAwaiter.ItHappened() }).Return(&logCancelOracleRequest)
+		log.On("RawLog").Return(types.Log{
+			Topics: []common.Hash{{}, {}},
 		})
+		log.On("String").Return("")
 
-		err := uni.service.Start()
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
 		require.NoError(t, err)
 
-		uni.listener.HandleLog(log)
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 10})
+		uni.listener.HandleLog(ctx, log)
 
-		cltest.EventuallyExpectationsMet(t, uni.logBroadcaster, 3*time.Second, 100*time.Millisecond)
-		cltest.EventuallyExpectationsMet(t, uni.runner, 3*time.Second, 100*time.Millisecond)
-		cltest.EventuallyExpectationsMet(t, log, 3*time.Second, 100*time.Millisecond)
+		logAwaiter.AwaitOrFail(t)
+		lbAwaiter.AwaitOrFail(t)
 
 		uni.service.Close()
 	})
@@ -240,28 +267,28 @@ func TestDelegate_ServicesListenerHandleLog(t *testing.T) {
 		uni := NewDirectRequestUniverse(t)
 		defer uni.Cleanup()
 
-		log := new(log_mocks.Broadcast)
+		log := log_mocks.NewBroadcast(t)
 
-		log.On("WasAlreadyConsumed").Return(false, nil)
-		logCancelOracleRequest := oracle_wrapper.OracleCancelOracleRequest{RequestId: uni.spec.DirectRequestSpec.OnChainJobSpecID}
-		log.On("RawLog").Return(models.Log{
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logCancelOracleRequest := operator_wrapper.OperatorCancelOracleRequest{RequestId: uni.spec.ExternalIDEncodeStringToTopic()}
+		log.On("RawLog").Return(types.Log{
 			Topics: []common.Hash{
-				common.Hash{},
-				uni.spec.DirectRequestSpec.OnChainJobSpecID,
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
 			},
 		})
+		log.On("String").Return("")
 		log.On("DecodedLog").Return(&logCancelOracleRequest)
-		log.On("MarkConsumed").Return(nil)
+		lbAwaiter := cltest.NewAwaiter()
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) { lbAwaiter.ItHappened() }).Return(nil)
 
-		err := uni.service.Start()
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
 		require.NoError(t, err)
 
-		uni.listener.HandleLog(log)
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 10})
+		uni.listener.HandleLog(ctx, log)
 
-		cltest.EventuallyExpectationsMet(t, uni.logBroadcaster, 3*time.Second, 100*time.Millisecond)
-		cltest.EventuallyExpectationsMet(t, uni.runner, 3*time.Second, 100*time.Millisecond)
-		cltest.EventuallyExpectationsMet(t, log, 3*time.Second, 100*time.Millisecond)
+		lbAwaiter.AwaitOrFail(t)
 
 		uni.service.Close()
 	})
@@ -270,42 +297,49 @@ func TestDelegate_ServicesListenerHandleLog(t *testing.T) {
 		uni := NewDirectRequestUniverse(t)
 		defer uni.Cleanup()
 
-		runLog := new(log_mocks.Broadcast)
+		runLog := log_mocks.NewBroadcast(t)
+		runLog.On("ReceiptsRoot").Return(common.Hash{})
+		runLog.On("TransactionsRoot").Return(common.Hash{})
+		runLog.On("StateRoot").Return(common.Hash{})
+		runLog.On("EVMChainID").Return(*big.NewInt(0))
 
-		runLog.On("WasAlreadyConsumed").Return(false, nil)
-		logOracleRequest := oracle_wrapper.OracleOracleRequest{
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
 			CancelExpiration: big.NewInt(0),
-			RequestId:        uni.spec.DirectRequestSpec.OnChainJobSpecID,
+			RequestId:        uni.spec.ExternalIDEncodeStringToTopic(),
 		}
-		runLog.On("RawLog").Return(models.Log{
+		runLog.On("RawLog").Return(types.Log{
 			Topics: []common.Hash{
-				common.Hash{},
-				uni.spec.DirectRequestSpec.OnChainJobSpecID,
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
 			},
 		})
 		runLog.On("DecodedLog").Return(&logOracleRequest)
-		runLog.On("MarkConsumed").Return(nil)
+		runLog.On("String").Return("")
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-		cancelLog := new(log_mocks.Broadcast)
+		cancelLog := log_mocks.NewBroadcast(t)
 
-		cancelLog.On("WasAlreadyConsumed").Return(false, nil)
-		logCancelOracleRequest := oracle_wrapper.OracleCancelOracleRequest{RequestId: uni.spec.DirectRequestSpec.OnChainJobSpecID}
-		cancelLog.On("RawLog").Return(models.Log{
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logCancelOracleRequest := operator_wrapper.OperatorCancelOracleRequest{RequestId: uni.spec.ExternalIDEncodeStringToTopic()}
+		cancelLog.On("RawLog").Return(types.Log{
 			Topics: []common.Hash{
-				common.Hash{},
-				uni.spec.DirectRequestSpec.OnChainJobSpecID,
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
 			},
 		})
 		cancelLog.On("DecodedLog").Return(&logCancelOracleRequest)
-		cancelLog.On("MarkConsumed").Return(nil)
+		cancelLog.On("String").Return("")
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-		err := uni.service.Start()
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
 		require.NoError(t, err)
 
 		timeout := 5 * time.Second
 		runBeganAwaiter := cltest.NewAwaiter()
 		runCancelledAwaiter := cltest.NewAwaiter()
-		uni.runner.On("ExecuteAndInsertNewRun", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		uni.runner.On("Run", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 			runBeganAwaiter.ItHappened()
 			ctx := args[0].(context.Context)
 			select {
@@ -314,45 +348,212 @@ func TestDelegate_ServicesListenerHandleLog(t *testing.T) {
 			case <-ctx.Done():
 				runCancelledAwaiter.ItHappened()
 			}
-		}).Once().Return(int64(0), pipeline.FinalResult{}, nil)
-		uni.listener.HandleLog(runLog)
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 10})
+		}).Once().Return(false, nil)
+		uni.listener.HandleLog(ctx, runLog)
 
 		runBeganAwaiter.AwaitOrFail(t, timeout)
-		runLog.AssertExpectations(t)
 
-		uni.listener.HandleLog(cancelLog)
-		uni.headBroadcastable.OnNewLongestChain(context.TODO(), models.Head{Number: 11})
+		uni.listener.HandleLog(ctx, cancelLog)
 
 		runCancelledAwaiter.AwaitOrFail(t, timeout)
-		cancelLog.AssertExpectations(t)
 
 		uni.service.Close()
-		uni.logBroadcaster.AssertExpectations(t)
-		uni.runner.AssertExpectations(t)
+	})
+
+	t.Run("Log has sufficient funds", func(t *testing.T) {
+		cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+			c.EVM[0].MinIncomingConfirmations = ptr[uint32](1)
+			c.EVM[0].MinContractPayment = assets.NewLinkFromJuels(100)
+		})
+		uni := NewDirectRequestUniverseWithConfig(t, cfg, nil)
+		defer uni.Cleanup()
+
+		log := log_mocks.NewBroadcast(t)
+		log.On("ReceiptsRoot").Return(common.Hash{})
+		log.On("TransactionsRoot").Return(common.Hash{})
+		log.On("StateRoot").Return(common.Hash{})
+		log.On("EVMChainID").Return(*big.NewInt(0))
+
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
+			CancelExpiration: big.NewInt(0),
+			Payment:          big.NewInt(100),
+		}
+		log.On("RawLog").Return(types.Log{
+			Topics: []common.Hash{
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
+			},
+		})
+		log.On("DecodedLog").Return(&logOracleRequest)
+		log.On("String").Return("")
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+		runBeganAwaiter := cltest.NewAwaiter()
+		uni.runner.On("Run", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			runBeganAwaiter.ItHappened()
+			fn := args.Get(3).(func(sqlutil.DataSource) error)
+			require.NoError(t, fn(nil))
+		}).Once().Return(false, nil)
+
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
+		require.NoError(t, err)
+
+		// check if the job exists under the correct ID
+		drJob, jErr := uni.jobORM.FindJob(ctx, uni.listener.JobID())
+		require.NoError(t, jErr)
+		require.Equal(t, drJob.ID, uni.listener.JobID())
+		require.NotNil(t, drJob.DirectRequestSpec)
+
+		uni.listener.HandleLog(ctx, log)
+
+		runBeganAwaiter.AwaitOrFail(t, 5*time.Second)
+
+		uni.service.Close()
+	})
+
+	t.Run("Log has insufficient funds", func(t *testing.T) {
+		cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+			c.EVM[0].MinIncomingConfirmations = ptr[uint32](1)
+			c.EVM[0].MinContractPayment = assets.NewLinkFromJuels(100)
+		})
+		uni := NewDirectRequestUniverseWithConfig(t, cfg, nil)
+		defer uni.Cleanup()
+
+		log := log_mocks.NewBroadcast(t)
+
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
+			CancelExpiration: big.NewInt(0),
+			Payment:          big.NewInt(99),
+		}
+		log.On("RawLog").Return(types.Log{
+			Topics: []common.Hash{
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
+			},
+		})
+		log.On("DecodedLog").Return(&logOracleRequest)
+		log.On("String").Return("")
+		markConsumedLogAwaiter := cltest.NewAwaiter()
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			markConsumedLogAwaiter.ItHappened()
+		}).Return(nil)
+
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
+		require.NoError(t, err)
+
+		uni.listener.HandleLog(ctx, log)
+
+		markConsumedLogAwaiter.AwaitOrFail(t, 5*time.Second)
+
+		uni.service.Close()
+	})
+
+	t.Run("requesters is specified and log is requested by a whitelisted address", func(t *testing.T) {
+		requester := testutils.NewAddress()
+		cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+			c.EVM[0].MinIncomingConfirmations = ptr[uint32](1)
+			c.EVM[0].MinContractPayment = assets.NewLinkFromJuels(100)
+		})
+		uni := NewDirectRequestUniverseWithConfig(t, cfg, func(jb *job.Job) {
+			jb.DirectRequestSpec.Requesters = []common.Address{testutils.NewAddress(), requester}
+		})
+		defer uni.Cleanup()
+
+		log := log_mocks.NewBroadcast(t)
+		log.On("ReceiptsRoot").Return(common.Hash{})
+		log.On("TransactionsRoot").Return(common.Hash{})
+		log.On("StateRoot").Return(common.Hash{})
+		log.On("EVMChainID").Return(*big.NewInt(0))
+
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
+			CancelExpiration: big.NewInt(0),
+			Payment:          big.NewInt(100),
+			Requester:        requester,
+		}
+		log.On("RawLog").Return(types.Log{
+			Topics: []common.Hash{
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
+			},
+		})
+		log.On("DecodedLog").Return(&logOracleRequest)
+		log.On("String").Return("")
+		markConsumedLogAwaiter := cltest.NewAwaiter()
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			markConsumedLogAwaiter.ItHappened()
+		}).Return(nil)
+
+		runBeganAwaiter := cltest.NewAwaiter()
+		uni.runner.On("Run", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			runBeganAwaiter.ItHappened()
+			fn := args.Get(3).(func(sqlutil.DataSource) error)
+			require.NoError(t, fn(nil))
+		}).Once().Return(false, nil)
+
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
+		require.NoError(t, err)
+
+		// check if the job exists under the correct ID
+		drJob, jErr := uni.jobORM.FindJob(ctx, uni.listener.JobID())
+		require.NoError(t, jErr)
+		require.Equal(t, drJob.ID, uni.listener.JobID())
+		require.NotNil(t, drJob.DirectRequestSpec)
+
+		uni.listener.HandleLog(ctx, log)
+
+		runBeganAwaiter.AwaitOrFail(t, 5*time.Second)
+
+		uni.service.Close()
+	})
+
+	t.Run("requesters is specified and log is requested by a non-whitelisted address", func(t *testing.T) {
+		requester := testutils.NewAddress()
+		cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+			c.EVM[0].MinIncomingConfirmations = ptr[uint32](1)
+			c.EVM[0].MinContractPayment = assets.NewLinkFromJuels(100)
+		})
+		uni := NewDirectRequestUniverseWithConfig(t, cfg, func(jb *job.Job) {
+			jb.DirectRequestSpec.Requesters = []common.Address{testutils.NewAddress(), testutils.NewAddress()}
+		})
+		defer uni.Cleanup()
+
+		log := log_mocks.NewBroadcast(t)
+
+		uni.logBroadcaster.On("WasAlreadyConsumed", mock.Anything, mock.Anything).Return(false, nil)
+		logOracleRequest := operator_wrapper.OperatorOracleRequest{
+			CancelExpiration: big.NewInt(0),
+			Payment:          big.NewInt(100),
+			Requester:        requester,
+		}
+		log.On("RawLog").Return(types.Log{
+			Topics: []common.Hash{
+				{},
+				uni.spec.ExternalIDEncodeStringToTopic(),
+			},
+		})
+		log.On("DecodedLog").Return(&logOracleRequest)
+		log.On("String").Return("")
+		markConsumedLogAwaiter := cltest.NewAwaiter()
+		uni.logBroadcaster.On("MarkConsumed", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			markConsumedLogAwaiter.ItHappened()
+		}).Return(nil)
+
+		ctx := testutils.Context(t)
+		err := uni.service.Start(ctx)
+		require.NoError(t, err)
+
+		uni.listener.HandleLog(ctx, log)
+
+		markConsumedLogAwaiter.AwaitOrFail(t, 5*time.Second)
+
+		uni.service.Close()
 	})
 }
 
-func factoryJobSpec(t *testing.T) *job.Job {
-	t.Helper()
-	drs := &job.DirectRequestSpec{}
-	onChainJobSpecID, err := uuid.NewV4()
-	require.NoError(t, err)
-	copy(drs.OnChainJobSpecID[:], onChainJobSpecID[:])
-	spec := &job.Job{
-		Type:              job.DirectRequest,
-		SchemaVersion:     1,
-		DirectRequestSpec: drs,
-		Pipeline:          *pipeline.NewTaskDAG(),
-		PipelineSpec:      &pipeline.Spec{},
-	}
-	return spec
-}
-
-type testConfig struct {
-	minRequiredOutgoingConfirmations uint64
-}
-
-func (c testConfig) MinRequiredOutgoingConfirmations() uint64 {
-	return c.minRequiredOutgoingConfirmations
-}
+func ptr[T any](t T) *T { return &t }

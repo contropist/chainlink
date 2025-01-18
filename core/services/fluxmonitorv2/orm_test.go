@@ -1,136 +1,147 @@
 package fluxmonitorv2_test
 
 import (
-	"context"
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"gopkg.in/guregu/null.v4"
 
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
-	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/tests"
+	commontxmmocks "github.com/smartcontractkit/chainlink/v2/common/txmgr/types/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr"
+	txmmocks "github.com/smartcontractkit/chainlink/v2/core/chains/evm/txmgr/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils/big"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/pgtest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
 
 func TestORM_MostRecentFluxMonitorRoundID(t *testing.T) {
 	t.Parallel()
+	ctx := tests.Context(t)
 
-	corestore, cleanup := cltest.NewStore(t)
-	t.Cleanup(cleanup)
+	db := pgtest.NewSqlxDB(t)
+	orm := newORM(t, db, nil)
 
-	orm := fluxmonitorv2.NewORM(corestore.DB)
-
-	address := cltest.NewAddress()
+	address := testutils.NewAddress()
 
 	// Setup the rounds
 	for round := uint32(0); round < 10; round++ {
-		_, err := orm.FindOrCreateFluxMonitorRoundStats(address, round)
+		_, err := orm.FindOrCreateFluxMonitorRoundStats(ctx, address, round, 1)
 		require.NoError(t, err)
 	}
 
-	count, err := orm.CountFluxMonitorRoundStats()
+	count, err := orm.CountFluxMonitorRoundStats(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 10, count)
 
 	// Ensure round stats are not created again for the same address/roundID
-	stats, err := orm.FindOrCreateFluxMonitorRoundStats(address, uint32(0))
+	stats, err := orm.FindOrCreateFluxMonitorRoundStats(ctx, address, uint32(0), 1)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), stats.RoundID)
 	require.Equal(t, address, stats.Aggregator)
+	require.Equal(t, uint64(1), stats.NumNewRoundLogs)
 
-	count, err = orm.CountFluxMonitorRoundStats()
+	count, err = orm.CountFluxMonitorRoundStats(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 10, count)
 
-	roundID, err := orm.MostRecentFluxMonitorRoundID(cltest.NewAddress())
+	roundID, err := orm.MostRecentFluxMonitorRoundID(ctx, testutils.NewAddress())
 	require.Error(t, err)
 	require.Equal(t, uint32(0), roundID)
 
-	roundID, err = orm.MostRecentFluxMonitorRoundID(address)
+	roundID, err = orm.MostRecentFluxMonitorRoundID(ctx, address)
 	require.NoError(t, err)
 	require.Equal(t, uint32(9), roundID)
 
 	// Deleting rounds against a new address should incur no changes
-	err = orm.DeleteFluxMonitorRoundsBackThrough(cltest.NewAddress(), 5)
+	err = orm.DeleteFluxMonitorRoundsBackThrough(ctx, testutils.NewAddress(), 5)
 	require.NoError(t, err)
 
-	count, err = orm.CountFluxMonitorRoundStats()
+	count, err = orm.CountFluxMonitorRoundStats(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 10, count)
 
 	// Deleting rounds against the address
-	err = orm.DeleteFluxMonitorRoundsBackThrough(address, 5)
+	err = orm.DeleteFluxMonitorRoundsBackThrough(ctx, address, 5)
 	require.NoError(t, err)
 
-	count, err = orm.CountFluxMonitorRoundStats()
+	count, err = orm.CountFluxMonitorRoundStats(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 5, count)
 }
 
 func TestORM_UpdateFluxMonitorRoundStats(t *testing.T) {
 	t.Parallel()
+	ctx := tests.Context(t)
 
-	corestore, cleanup := cltest.NewStore(t)
-	t.Cleanup(cleanup)
+	cfg := configtest.NewGeneralConfig(t, nil)
+	db := pgtest.NewSqlxDB(t)
+
+	keyStore := cltest.NewKeyStore(t, db)
+	lggr := logger.TestLogger(t)
 
 	// Instantiate a real pipeline ORM because we need to create a pipeline run
 	// for the foreign key constraint of the stats record
-	eventBroadcaster := postgres.NewEventBroadcaster(
-		corestore.Config.DatabaseURL(),
-		corestore.Config.DatabaseListenerMinReconnectInterval(),
-		corestore.Config.DatabaseListenerMaxReconnectDuration(),
-	)
-	pipelineORM := pipeline.NewORM(corestore.ORM.DB, corestore.Config, eventBroadcaster)
+	pipelineORM := pipeline.NewORM(db, lggr, cfg.JobPipeline().MaxSuccessfulRuns())
+	bridgeORM := bridges.NewORM(db)
+
 	// Instantiate a real job ORM because we need to create a job to satisfy
 	// a check in pipeline.CreateRun
-	jobORM := job.NewORM(corestore.ORM.DB, corestore.Config, pipelineORM, eventBroadcaster, &postgres.NullAdvisoryLocker{})
-	orm := fluxmonitorv2.NewORM(corestore.DB)
+	jobORM := job.NewORM(db, pipelineORM, bridgeORM, keyStore, lggr)
+	orm := newORM(t, db, nil)
 
-	address := cltest.NewAddress()
+	address := testutils.NewAddress()
 	var roundID uint32 = 1
 
-	j := makeJob(t)
-	err := jobORM.CreateJob(context.Background(), j, *pipeline.NewTaskDAG())
-	require.NoError(t, err)
-
-	jb, err := jobORM.FindJob(j.ID)
-	require.NoError(t, err)
+	jb := makeJob(t)
+	require.NoError(t, jobORM.CreateJob(ctx, jb))
 
 	for expectedCount := uint64(1); expectedCount < 4; expectedCount++ {
 		f := time.Now()
-		runID, err := pipelineORM.InsertFinishedRunWithResults(context.Background(),
-			pipeline.Run{
+		run :=
+			&pipeline.Run{
+				State:          pipeline.RunStatusCompleted,
 				PipelineSpecID: jb.PipelineSpec.ID,
+				PruningKey:     jb.ID,
 				PipelineSpec:   *jb.PipelineSpec,
 				CreatedAt:      time.Now(),
-				FinishedAt:     &f,
-				Errors:         pipeline.RunErrors{null.String{}},
-				Outputs:        pipeline.JSONSerializable{Val: []interface{}{10}},
-			}, pipeline.TaskRunResults{
-				{
-					Task:       &pipeline.HTTPTask{},
-					Result:     pipeline.Result{Value: 10},
-					CreatedAt:  f,
-					FinishedAt: f,
-					IsTerminal: true,
+				FinishedAt:     null.TimeFrom(f),
+				AllErrors:      pipeline.RunErrors{null.String{}},
+				FatalErrors:    pipeline.RunErrors{null.String{}},
+				Outputs:        jsonserializable.JSONSerializable{Val: []interface{}{10}, Valid: true},
+				PipelineTaskRuns: []pipeline.TaskRun{
+					{
+						ID:         uuid.New(),
+						Type:       pipeline.TaskTypeHTTP,
+						Output:     jsonserializable.JSONSerializable{Val: 10, Valid: true},
+						CreatedAt:  f,
+						FinishedAt: null.TimeFrom(f),
+					},
 				},
-			}, true)
+			}
+		err := pipelineORM.InsertFinishedRun(ctx, run, true)
 		require.NoError(t, err)
 
-		err = orm.UpdateFluxMonitorRoundStats(address, roundID, runID)
+		err = orm.UpdateFluxMonitorRoundStats(ctx, address, roundID, run.ID, 0)
 		require.NoError(t, err)
 
-		stats, err := orm.FindOrCreateFluxMonitorRoundStats(address, roundID)
+		stats, err := orm.FindOrCreateFluxMonitorRoundStats(ctx, address, roundID, 0)
 		require.NoError(t, err)
 		require.Equal(t, expectedCount, stats.NumSubmissions)
 		require.True(t, stats.PipelineRunID.Valid)
-		require.Equal(t, runID, stats.PipelineRunID.Int64)
+		require.Equal(t, run.ID, stats.PipelineRunID.Int64)
 	}
 }
 
@@ -138,14 +149,13 @@ func makeJob(t *testing.T) *job.Job {
 	t.Helper()
 
 	return &job.Job{
-		IDEmbed:       job.IDEmbed{ID: 1},
+		ID:            1,
 		Type:          "fluxmonitor",
 		SchemaVersion: 1,
-		Pipeline:      *pipeline.NewTaskDAG(),
+		ExternalJobID: uuid.New(),
 		FluxMonitorSpec: &job.FluxMonitorSpec{
-			IDEmbed:           job.IDEmbed{ID: 2},
+			ID:                2,
 			ContractAddress:   cltest.NewEIP55Address(),
-			Precision:         2,
 			Threshold:         0.5,
 			PollTimerPeriod:   1 * time.Second,
 			PollTimerDisabled: false,
@@ -153,6 +163,7 @@ func makeJob(t *testing.T) *job.Job {
 			IdleTimerDisabled: false,
 			CreatedAt:         time.Now(),
 			UpdatedAt:         time.Now(),
+			EVMChainID:        (*big.Big)(testutils.FixtureChainID),
 		},
 	}
 }
@@ -160,77 +171,30 @@ func makeJob(t *testing.T) *job.Job {
 func TestORM_CreateEthTransaction(t *testing.T) {
 	t.Parallel()
 
-	corestore, cleanup := cltest.NewStore(t)
-	t.Cleanup(cleanup)
+	db := pgtest.NewSqlxDB(t)
+	ethKeyStore := cltest.NewKeyStore(t, db).Eth()
+
+	strategy := commontxmmocks.NewTxStrategy(t)
 
 	var (
-		orm = fluxmonitorv2.NewORM(corestore.DB)
+		txm = txmmocks.NewMockEvmTxManager(t)
+		orm = fluxmonitorv2.NewORM(db, logger.TestLogger(t), txm, strategy, txmgr.TransmitCheckerSpec{})
 
-		key      = cltest.MustInsertRandomKey(t, corestore.DB, 0)
-		from     = key.Address.Address()
-		to       = cltest.NewAddress()
+		_, from  = cltest.MustInsertRandomKey(t, ethKeyStore)
+		to       = testutils.NewAddress()
 		payload  = []byte{1, 0, 0}
 		gasLimit = uint64(21000)
 	)
+	idempotencyKey := uuid.New().String()
+	txm.On("CreateTransaction", mock.Anything, txmgr.TxRequest{
+		IdempotencyKey: &idempotencyKey,
+		FromAddress:    from,
+		ToAddress:      to,
+		EncodedPayload: payload,
+		FeeLimit:       gasLimit,
+		Meta:           nil,
+		Strategy:       strategy,
+	}).Return(txmgr.Tx{}, nil).Once()
 
-	orm.CreateEthTransaction(from, to, payload, gasLimit, 0)
-
-	etx := models.EthTx{}
-	require.NoError(t, corestore.ORM.DB.First(&etx).Error)
-
-	require.Equal(t, gasLimit, etx.GasLimit)
-	require.Equal(t, from, etx.FromAddress)
-	require.Equal(t, to, etx.ToAddress)
-	require.Equal(t, payload, etx.EncodedPayload)
-	require.Equal(t, assets.NewEthValue(0), etx.Value)
-}
-
-func TestORM_CreateEthTransaction_OutOfEth(t *testing.T) {
-	t.Parallel()
-
-	corestore, cleanup := cltest.NewStore(t)
-	t.Cleanup(cleanup)
-
-	var (
-		orm = fluxmonitorv2.NewORM(corestore.DB)
-
-		key      = cltest.MustInsertRandomKey(t, corestore.DB, 1)
-		otherKey = cltest.MustInsertRandomKey(t, corestore.DB, 1)
-		from     = key.Address.Address()
-		to       = cltest.NewAddress()
-		payload  = []byte{1, 0, 0}
-		gasLimit = uint64(21000)
-	)
-
-	t.Run("if another key has any transactions with insufficient eth errors, transmits as normal", func(t *testing.T) {
-		cltest.MustInsertUnconfirmedEthTxWithInsufficientEthAttempt(t, corestore, 0, otherKey.Address.Address())
-
-		err := orm.CreateEthTransaction(from, to, payload, gasLimit, 0)
-		require.NoError(t, err)
-
-		etx := models.EthTx{}
-		require.NoError(t, corestore.ORM.DB.First(&etx, "nonce IS NULL AND from_address = ?", from).Error)
-		require.Equal(t, payload, etx.EncodedPayload)
-	})
-
-	require.NoError(t, corestore.DB.Exec(`DELETE FROM eth_txes WHERE from_address = ?`, from).Error)
-
-	t.Run("if this key has any transactions with insufficient eth errors, skips transmission entirely", func(t *testing.T) {
-		cltest.MustInsertUnconfirmedEthTxWithInsufficientEthAttempt(t, corestore, 0, from)
-
-		err := orm.CreateEthTransaction(from, to, payload, gasLimit, 0)
-		require.EqualError(t, err, fmt.Sprintf("Skipped Flux Monitor submission because wallet is out of eth: %s", from))
-	})
-
-	t.Run("if this key has transactions but no insufficient eth errors, transmits as normal", func(t *testing.T) {
-		require.NoError(t, corestore.DB.Exec(`UPDATE eth_tx_attempts SET state = 'broadcast'`).Error)
-		require.NoError(t, corestore.DB.Exec(`UPDATE eth_txes SET nonce = 0, state = 'confirmed', broadcast_at = NOW()`).Error)
-
-		err := orm.CreateEthTransaction(from, to, payload, gasLimit, 0)
-		require.NoError(t, err)
-
-		etx := models.EthTx{}
-		require.NoError(t, corestore.ORM.DB.First(&etx, "nonce IS NULL AND from_address = ?", from).Error)
-		require.Equal(t, payload, etx.EncodedPayload)
-	})
+	require.NoError(t, orm.CreateEthTransaction(testutils.Context(t), from, to, payload, gasLimit, &idempotencyKey))
 }

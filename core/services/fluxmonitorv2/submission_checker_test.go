@@ -5,11 +5,13 @@ import (
 	"testing"
 
 	"github.com/shopspring/decimal"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
 )
 
 func TestSubmissionChecker_IsValid(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name   string
 		answer decimal.Decimal
@@ -17,27 +19,27 @@ func TestSubmissionChecker_IsValid(t *testing.T) {
 	}{
 		{
 			name:   "equal to min",
-			answer: decimal.NewFromFloat(0.01),
+			answer: decimal.NewFromFloat(1),
 			want:   true,
 		},
 		{
 			name:   "in between",
-			answer: decimal.NewFromFloat(0.02),
+			answer: decimal.NewFromFloat(2),
 			want:   true,
 		},
 		{
 			name:   "equal to max",
-			answer: decimal.NewFromFloat(0.03),
+			answer: decimal.NewFromFloat(3),
 			want:   true,
 		},
 		{
 			name:   "below min",
-			answer: decimal.NewFromFloat(0.0),
+			answer: decimal.NewFromFloat(0),
 			want:   false,
 		},
 		{
 			name:   "over max",
-			answer: decimal.NewFromFloat(0.04),
+			answer: decimal.NewFromFloat(4),
 			want:   false,
 		},
 	}
@@ -45,7 +47,6 @@ func TestSubmissionChecker_IsValid(t *testing.T) {
 	checker := fluxmonitorv2.NewSubmissionChecker(
 		big.NewInt(1),
 		big.NewInt(3),
-		2,
 	)
 
 	for _, tc := range testCases {

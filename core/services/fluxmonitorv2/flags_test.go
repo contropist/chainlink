@@ -4,12 +4,13 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
-	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/chains/evm/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
 )
 
 func TestFlags_IsLowered(t *testing.T) {
@@ -32,11 +33,11 @@ func TestFlags_IsLowered(t *testing.T) {
 			t.Parallel()
 
 			var (
-				flagsContract = new(mocks.Flags)
-				address       = cltest.NewAddress()
+				flagsContract = mocks.NewFlags(t)
+				address       = testutils.NewAddress()
 			)
 
-			flags := fluxmonitorv2.Flags{FlagsInterface: flagsContract}
+			flags := fluxmonitorv2.ContractFlags{FlagsInterface: flagsContract}
 
 			flagsContract.On("GetFlags", mock.Anything, mock.Anything).
 				Run(func(args mock.Arguments) {
@@ -50,8 +51,6 @@ func TestFlags_IsLowered(t *testing.T) {
 			result, err := flags.IsLowered(address)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, result)
-
-			flagsContract.AssertExpectations(t)
 		})
 	}
 }

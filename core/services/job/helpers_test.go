@@ -2,26 +2,29 @@ package job_test
 
 import (
 	"fmt"
+	"math/big"
 	"testing"
 	"time"
 
-	"github.com/lib/pq"
-
-	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
-
-	"gopkg.in/guregu/null.v4"
-
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"gorm.io/gorm"
-
-	"github.com/smartcontractkit/chainlink/core/services/job"
-
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/google/uuid"
+	"github.com/hashicorp/consul/sdk/freeport"
+	"github.com/lib/pq"
 	"github.com/pelletier/go-toml"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/guregu/null.v4"
 
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/jmoiron/sqlx"
+
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/evmtest"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/chaintype"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocr"
+	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
 const (
@@ -29,10 +32,8 @@ const (
 type               = "offchainreporting"
 schemaVersion      = 1
 contractAddress    = "%s"
-p2pPeerID          = "%s"
-p2pBootstrapPeers  = [
-    "/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
+evmChainID		   = "0"
+p2pv2Bootstrappers = ["12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq@127.0.0.1:5001"]
 isBootstrapPeer    = false
 keyBundleID        = "%s"
 monitoringEndpoint = "chain.link:4321"
@@ -46,9 +47,33 @@ observationSource = """
 	%s
 """
 `
+
+	ocr2Keeper21JobSpecTemplate = `
+type = "offchainreporting2"
+pluginType = "ocr2automation"
+relay = "evm"
+name = "ocr2keeper"
+schemaVersion = 1
+contractID = "%s"
+contractConfigTrackerPollInterval = "15s"
+ocrKeyBundleID = "%s"
+transmitterID = "%s"
+p2pv2Bootstrappers = [
+"%s"
+]
+
+[relayConfig]
+chainID = %d
+
+[pluginConfig]
+maxServiceWorkers = 100
+cacheEvictionInterval = "1s"
+mercuryCredentialName = "%s"
+contractVersion = "v2.1"
+`
 	voterTurnoutDataSourceTemplate = `
 // data source 1
-ds1          [type=bridge name=voter_turnout];
+ds1          [type=bridge name="%s"];
 ds1_parse    [type=jsonparse path="data,result"];
 ds1_multiply [type=multiply times=100];
 
@@ -61,7 +86,7 @@ ds1 -> ds1_parse -> ds1_multiply -> answer1;
 ds2 -> ds2_parse -> ds2_multiply -> answer1;
 
 answer1 [type=median                      index=0];
-answer2 [type=bridge name=election_winner index=1];
+answer2 [type=bridge name="%s" index=1];
 `
 
 	simpleFetchDataSourceTemplate = `
@@ -75,12 +100,12 @@ ds1 -> ds1_parse -> ds1_multiply;
 		type               = "offchainreporting"
 		schemaVersion      = 1
 		contractAddress    = "%s"
-		p2pPeerID          = "%s"
-		p2pBootstrapPeers  = ["/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju"]
-		isBootstrapPeer    = false 
+		p2pv2Bootstrappers = ["12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq@127.0.0.1:5001"]
+		isBootstrapPeer    = false
 		transmitterAddress = "%s"
 		keyBundleID = "%s"
 		observationTimeout = "10s"
+		evmChainID		   = "0"
 		observationSource = """
 ds1          [type=http method=GET url="%s" allowunrestrictednetworkaccess="true" %s];
 ds1_parse    [type=jsonparse path="USD" lax=true];
@@ -91,18 +116,16 @@ ds1 -> ds1_parse;
 		type               = "offchainreporting"
 		schemaVersion      = 1
 		contractAddress    = "%s"
-		p2pPeerID          = "%s"
-		p2pBootstrapPeers  = []
+		evmChainID		   = "0"
 		isBootstrapPeer    = true
 `
 	ocrJobSpecText = `
 type               = "offchainreporting"
 schemaVersion      = 1
 contractAddress    = "%s"
+evmChainID		   = "0"
 p2pPeerID          = "%s"
-p2pBootstrapPeers  = [
-    "/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
+p2pv2Bootstrappers = ["12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq@127.0.0.1:5001"]
 isBootstrapPeer    = false
 keyBundleID        = "%s"
 monitoringEndpoint = "chain.link:4321"
@@ -114,7 +137,7 @@ contractConfigTrackerPollInterval = "1m"
 contractConfigConfirmations = 3
 observationSource = """
     // data source 1
-    ds1          [type=bridge name=voter_turnout];
+    ds1          [type=bridge name="%s"];
     ds1_parse    [type=jsonparse path="one,two"];
     ds1_multiply [type=multiply times=1.23];
 
@@ -127,27 +150,27 @@ observationSource = """
     ds2 -> ds2_parse -> ds2_multiply -> answer1;
 
     answer1 [type=median                      index=0];
-    answer2 [type=bridge name=election_winner index=1];
+    answer2 [type=bridge name="%s" index=1];
 """
 `
 )
 
-func makeOCRJobSpec(t *testing.T, transmitterAddress common.Address) *job.Job {
+func makeOCRJobSpec(t *testing.T, transmitterAddress common.Address, b1, b2 string) *job.Job {
 	t.Helper()
 
 	peerID := cltest.DefaultP2PPeerID
 	ocrKeyID := cltest.DefaultOCRKeyBundleID
-	jobSpecText := fmt.Sprintf(ocrJobSpecText, cltest.NewAddress().Hex(), peerID.String(), ocrKeyID, transmitterAddress.Hex())
+	jobSpecText := fmt.Sprintf(ocrJobSpecText, testutils.NewAddress().Hex(), peerID, ocrKeyID, transmitterAddress.Hex(), b1, b2)
 
 	dbSpec := job.Job{
-		Pipeline: *pipeline.NewTaskDAG(),
+		ExternalJobID: uuid.New(),
 	}
 	err := toml.Unmarshal([]byte(jobSpecText), &dbSpec)
 	require.NoError(t, err)
-	var ocrspec job.OffchainReportingOracleSpec
+	var ocrspec job.OCROracleSpec
 	err = toml.Unmarshal([]byte(jobSpecText), &ocrspec)
 	require.NoError(t, err)
-	dbSpec.OffchainreportingOracleSpec = &ocrspec
+	dbSpec.OCROracleSpec = &ocrspec
 
 	return &dbSpec
 }
@@ -157,24 +180,22 @@ func makeOCRJobSpec(t *testing.T, transmitterAddress common.Address) *job.Job {
 //
 // https://github.com/stretchr/testify/issues/984
 func compareOCRJobSpecs(t *testing.T, expected, actual job.Job) {
-	t.Helper()
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractAddress, actual.OffchainreportingOracleSpec.ContractAddress)
-	require.Equal(t, expected.OffchainreportingOracleSpec.P2PPeerID, actual.OffchainreportingOracleSpec.P2PPeerID)
-	require.Equal(t, expected.OffchainreportingOracleSpec.P2PBootstrapPeers, actual.OffchainreportingOracleSpec.P2PBootstrapPeers)
-	require.Equal(t, expected.OffchainreportingOracleSpec.IsBootstrapPeer, actual.OffchainreportingOracleSpec.IsBootstrapPeer)
-	require.Equal(t, expected.OffchainreportingOracleSpec.EncryptedOCRKeyBundleID, actual.OffchainreportingOracleSpec.EncryptedOCRKeyBundleID)
-	require.Equal(t, expected.OffchainreportingOracleSpec.TransmitterAddress, actual.OffchainreportingOracleSpec.TransmitterAddress)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ObservationTimeout, actual.OffchainreportingOracleSpec.ObservationTimeout)
-	require.Equal(t, expected.OffchainreportingOracleSpec.BlockchainTimeout, actual.OffchainreportingOracleSpec.BlockchainTimeout)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractConfigTrackerSubscribeInterval, actual.OffchainreportingOracleSpec.ContractConfigTrackerSubscribeInterval)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractConfigTrackerPollInterval, actual.OffchainreportingOracleSpec.ContractConfigTrackerPollInterval)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractConfigConfirmations, actual.OffchainreportingOracleSpec.ContractConfigConfirmations)
+	require.NotNil(t, expected.OCROracleSpec)
+	require.Equal(t, expected.OCROracleSpec.ContractAddress, actual.OCROracleSpec.ContractAddress)
+	require.Equal(t, expected.OCROracleSpec.P2PV2Bootstrappers, actual.OCROracleSpec.P2PV2Bootstrappers)
+	require.Equal(t, expected.OCROracleSpec.IsBootstrapPeer, actual.OCROracleSpec.IsBootstrapPeer)
+	require.Equal(t, expected.OCROracleSpec.EncryptedOCRKeyBundleID, actual.OCROracleSpec.EncryptedOCRKeyBundleID)
+	require.Equal(t, expected.OCROracleSpec.TransmitterAddress, actual.OCROracleSpec.TransmitterAddress)
+	require.Equal(t, expected.OCROracleSpec.ObservationTimeout, actual.OCROracleSpec.ObservationTimeout)
+	require.Equal(t, expected.OCROracleSpec.BlockchainTimeout, actual.OCROracleSpec.BlockchainTimeout)
+	require.Equal(t, expected.OCROracleSpec.ContractConfigTrackerSubscribeInterval, actual.OCROracleSpec.ContractConfigTrackerSubscribeInterval)
+	require.Equal(t, expected.OCROracleSpec.ContractConfigTrackerPollInterval, actual.OCROracleSpec.ContractConfigTrackerPollInterval)
+	require.Equal(t, expected.OCROracleSpec.ContractConfigConfirmations, actual.OCROracleSpec.ContractConfigConfirmations)
 }
 
-func makeMinimalHTTPOracleSpec(t *testing.T, contractAddress, peerID, transmitterAddress, keyBundle, fetchUrl, timeout string) *job.Job {
-	t.Helper()
-	var ocrSpec = job.OffchainReportingOracleSpec{
-		P2PBootstrapPeers:                      pq.StringArray{},
+func makeMinimalHTTPOracleSpec(t *testing.T, db *sqlx.DB, cfg chainlink.GeneralConfig, contractAddress, transmitterAddress, keyBundle, fetchUrl, timeout string) *job.Job {
+	var ocrSpec = job.OCROracleSpec{
+		P2PV2Bootstrappers:                     pq.StringArray{},
 		ObservationTimeout:                     models.Interval(10 * time.Second),
 		BlockchainTimeout:                      models.Interval(20 * time.Second),
 		ContractConfigTrackerSubscribeInterval: models.Interval(2 * time.Minute),
@@ -183,58 +204,100 @@ func makeMinimalHTTPOracleSpec(t *testing.T, contractAddress, peerID, transmitte
 	}
 	var os = job.Job{
 		Name:          null.NewString("a job", true),
-		Pipeline:      *pipeline.NewTaskDAG(),
 		Type:          job.OffchainReporting,
 		SchemaVersion: 1,
+		ExternalJobID: uuid.New(),
 	}
-	s := fmt.Sprintf(minimalNonBootstrapTemplate, contractAddress, peerID, transmitterAddress, keyBundle, fetchUrl, timeout)
-	c, cl := cltest.NewConfig(t)
-	defer cl()
-	_, err := offchainreporting.ValidatedOracleSpecToml(c.Config, s)
+	s := fmt.Sprintf(minimalNonBootstrapTemplate, contractAddress, transmitterAddress, keyBundle, fetchUrl, timeout)
+	keyStore := cltest.NewKeyStore(t, db)
+	legacyChains := evmtest.NewLegacyChains(t, evmtest.TestChainOpts{DB: db, Client: evmtest.NewEthClientMockWithDefaultChain(t), GeneralConfig: cfg, KeyStore: keyStore.Eth()})
+	_, err := ocr.ValidatedOracleSpecToml(cfg, legacyChains, s)
 	require.NoError(t, err)
 	err = toml.Unmarshal([]byte(s), &os)
 	require.NoError(t, err)
 	err = toml.Unmarshal([]byte(s), &ocrSpec)
 	require.NoError(t, err)
-	os.OffchainreportingOracleSpec = &ocrSpec
+	os.OCROracleSpec = &ocrSpec
 	return &os
 }
 
-func makeVoterTurnoutOCRJobSpec(t *testing.T, db *gorm.DB, transmitterAddress common.Address) *job.Job {
+func makeVoterTurnoutOCRJobSpec(t *testing.T, transmitterAddress common.Address, b1, b2 string) *job.Job {
 	t.Helper()
-	return MakeVoterTurnoutOCRJobSpecWithHTTPURL(t, db, transmitterAddress, "https://example.com/foo/bar")
+	return MakeVoterTurnoutOCRJobSpecWithHTTPURL(t, transmitterAddress, "https://example.com/foo/bar", b1, b2)
 }
 
-func MakeVoterTurnoutOCRJobSpecWithHTTPURL(t *testing.T, db *gorm.DB, transmitterAddress common.Address, httpURL string) *job.Job {
+func MakeVoterTurnoutOCRJobSpecWithHTTPURL(t *testing.T, transmitterAddress common.Address, httpURL, b1, b2 string) *job.Job {
 	t.Helper()
-	peerID := cltest.DefaultP2PPeerID
 	ocrKeyID := cltest.DefaultOCRKeyBundleID
-	ds := fmt.Sprintf(voterTurnoutDataSourceTemplate, httpURL)
-	voterTurnoutJobSpec := fmt.Sprintf(ocrJobSpecTemplate, cltest.NewAddress().Hex(), peerID, ocrKeyID, transmitterAddress.Hex(), ds)
-	return makeOCRJobSpecFromToml(t, db, voterTurnoutJobSpec)
+	ds := fmt.Sprintf(voterTurnoutDataSourceTemplate, b1, httpURL, b2)
+	voterTurnoutJobSpec := fmt.Sprintf(ocrJobSpecTemplate, testutils.NewAddress().Hex(), ocrKeyID, transmitterAddress.Hex(), ds)
+	return makeOCRJobSpecFromToml(t, voterTurnoutJobSpec)
 }
 
-func makeSimpleFetchOCRJobSpecWithHTTPURL(t *testing.T, db *gorm.DB, transmitterAddress common.Address, httpURL string, lax bool) *job.Job {
+func makeSimpleFetchOCRJobSpecWithHTTPURL(t *testing.T, transmitterAddress common.Address, httpURL string, lax bool) *job.Job {
 	t.Helper()
-	peerID := cltest.DefaultP2PPeerID
 	ocrKeyID := cltest.DefaultOCRKeyBundleID
 	ds := fmt.Sprintf(simpleFetchDataSourceTemplate, httpURL, lax)
-	simpleFetchJobSpec := fmt.Sprintf(ocrJobSpecTemplate, cltest.NewAddress().Hex(), peerID, ocrKeyID, transmitterAddress.Hex(), ds)
-	return makeOCRJobSpecFromToml(t, db, simpleFetchJobSpec)
+	simpleFetchJobSpec := fmt.Sprintf(ocrJobSpecTemplate, testutils.NewAddress().Hex(), ocrKeyID, transmitterAddress.Hex(), ds)
+	return makeOCRJobSpecFromToml(t, simpleFetchJobSpec)
 }
 
-func makeOCRJobSpecFromToml(t *testing.T, db *gorm.DB, jobSpecToml string) *job.Job {
+func makeOCRJobSpecFromToml(t *testing.T, jobSpecToml string) *job.Job {
 	t.Helper()
 
+	id := uuid.New()
 	var jb = job.Job{
-		Pipeline: *pipeline.NewTaskDAG(),
+		Name:          null.StringFrom(id.String()),
+		ExternalJobID: id,
 	}
 	err := toml.Unmarshal([]byte(jobSpecToml), &jb)
 	require.NoError(t, err)
-	var ocrspec job.OffchainReportingOracleSpec
+	var ocrspec job.OCROracleSpec
 	err = toml.Unmarshal([]byte(jobSpecToml), &ocrspec)
 	require.NoError(t, err)
-	jb.OffchainreportingOracleSpec = &ocrspec
+	if ocrspec.P2PV2Bootstrappers == nil {
+		ocrspec.P2PV2Bootstrappers = pq.StringArray{}
+	}
+	jb.OCROracleSpec = &ocrspec
+
+	return &jb
+}
+
+func makeOCR2Keeper21JobSpec(t testing.TB, ks keystore.Master, transmitter common.Address, chainID *big.Int) *job.Job {
+	t.Helper()
+	ctx := testutils.Context(t)
+
+	bootstrapNodePort := freeport.GetOne(t)
+	bootstrapPeerID := "peerId"
+
+	kb, _ := ks.OCR2().Create(ctx, chaintype.EVM)
+	_, registry := cltest.MustInsertRandomKey(t, ks.Eth())
+
+	ocr2Keeper21Job := fmt.Sprintf(ocr2Keeper21JobSpecTemplate, registry.String(), kb.ID(), transmitter,
+		fmt.Sprintf("%s127.0.0.1:%d", bootstrapPeerID, bootstrapNodePort), chainID, "mercury cred")
+
+	jobSpec := makeOCR2JobSpecFromToml(t, ocr2Keeper21Job)
+
+	return jobSpec
+}
+
+func makeOCR2JobSpecFromToml(t testing.TB, jobSpecToml string) *job.Job {
+	t.Helper()
+
+	id := uuid.New()
+	var jb = job.Job{
+		Name:          null.StringFrom(id.String()),
+		ExternalJobID: id,
+	}
+	err := toml.Unmarshal([]byte(jobSpecToml), &jb)
+	require.NoError(t, err, jobSpecToml)
+	var ocr2spec job.OCR2OracleSpec
+	err = toml.Unmarshal([]byte(jobSpecToml), &ocr2spec)
+	require.NoError(t, err)
+	if ocr2spec.P2PV2Bootstrappers == nil {
+		ocr2spec.P2PV2Bootstrappers = pq.StringArray{}
+	}
+	jb.OCR2OracleSpec = &ocr2spec
 
 	return &jb
 }

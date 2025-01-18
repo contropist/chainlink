@@ -4,23 +4,28 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
-	fmmocks "github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2/mocks"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/smartcontractkit/chainlink/v2/core/internal/mocks"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
+	fmmocks "github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2/mocks"
 )
 
 func TestFluxAggregatorContractSubmitter_Submit(t *testing.T) {
+	t.Parallel()
 	var (
-		fluxAggregator = new(mocks.FluxAggregator)
-		orm            = new(fmmocks.ORM)
-		keyStore       = new(fmmocks.KeyStoreInterface)
-		gasLimit       = uint64(2100)
-		submitter      = fluxmonitorv2.NewFluxAggregatorContractSubmitter(fluxAggregator, orm, keyStore, gasLimit, 0)
+		fluxAggregator    = mocks.NewFluxAggregator(t)
+		orm               = fmmocks.NewORM(t)
+		keyStore          = fmmocks.NewKeyStoreInterface(t)
+		gasLimit          = uint64(2100)
+		forwardingAllowed = false
+		submitter         = fluxmonitorv2.NewFluxAggregatorContractSubmitter(fluxAggregator, orm, keyStore, gasLimit, forwardingAllowed, testutils.FixtureChainID)
 
-		toAddress   = cltest.NewAddress()
-		fromAddress = cltest.NewAddress()
+		toAddress   = testutils.NewAddress()
+		fromAddress = testutils.NewAddress()
 		roundID     = big.NewInt(1)
 		submission  = big.NewInt(2)
 	)
@@ -28,10 +33,12 @@ func TestFluxAggregatorContractSubmitter_Submit(t *testing.T) {
 	payload, err := fluxmonitorv2.FluxAggregatorABI.Pack("submit", roundID, submission)
 	assert.NoError(t, err)
 
-	keyStore.On("GetRoundRobinAddress").Return(fromAddress, nil)
+	keyStore.On("GetRoundRobinAddress", mock.Anything, testutils.FixtureChainID).Return(fromAddress, nil)
 	fluxAggregator.On("Address").Return(toAddress)
-	orm.On("CreateEthTransaction", fromAddress, toAddress, payload, gasLimit, uint64(0)).Return(nil)
 
-	err = submitter.Submit(roundID, submission)
+	idempotencyKey := uuid.New().String()
+	orm.On("CreateEthTransaction", mock.Anything, fromAddress, toAddress, payload, gasLimit, &idempotencyKey).Return(nil)
+
+	err = submitter.Submit(testutils.Context(t), roundID, submission, &idempotencyKey)
 	assert.NoError(t, err)
 }

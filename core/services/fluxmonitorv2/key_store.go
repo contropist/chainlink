@@ -1,36 +1,27 @@
 package fluxmonitorv2
 
 import (
-	"github.com/ethereum/go-ethereum/accounts"
-	"github.com/ethereum/go-ethereum/common"
-	corestore "github.com/smartcontractkit/chainlink/core/store"
-)
+	"context"
+	"math/big"
 
-//go:generate mockery --name KeyStoreInterface --output ./mocks/ --case=underscore
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore/keys/ethkey"
+)
 
 // KeyStoreInterface defines an interface to interact with the keystore
 type KeyStoreInterface interface {
-	Accounts() []accounts.Account
-	GetRoundRobinAddress() (common.Address, error)
+	EnabledKeysForChain(ctx context.Context, chainID *big.Int) ([]ethkey.KeyV2, error)
+	GetRoundRobinAddress(ctx context.Context, chainID *big.Int, addrs ...common.Address) (common.Address, error)
 }
 
 // KeyStore implements KeyStoreInterface
 type KeyStore struct {
-	store *corestore.Store
+	keystore.Eth
 }
 
 // NewKeyStore initializes a new keystore
-func NewKeyStore(store *corestore.Store) *KeyStore {
-	return &KeyStore{store: store}
-}
-
-// Accounts gets the node's accounts from the keystore
-func (ks *KeyStore) Accounts() []accounts.Account {
-	return ks.store.KeyStore.Accounts()
-}
-
-// GetRoundRobinAddress queries the database for the address of a random
-// ethereum key derived from the id.
-func (ks *KeyStore) GetRoundRobinAddress() (common.Address, error) {
-	return ks.store.GetRoundRobinAddress()
+func NewKeyStore(ks keystore.Eth) *KeyStore {
+	return &KeyStore{ks}
 }

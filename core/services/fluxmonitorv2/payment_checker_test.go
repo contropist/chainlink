@@ -4,12 +4,14 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/assets"
+	"github.com/smartcontractkit/chainlink/v2/core/services/fluxmonitorv2"
 )
 
 func TestPaymentChecker_SufficientFunds(t *testing.T) {
+	t.Parallel()
 	var (
 		checker     = fluxmonitorv2.NewPaymentChecker(nil, nil)
 		payment     = 100
@@ -43,11 +45,12 @@ func TestPaymentChecker_SufficientFunds(t *testing.T) {
 }
 
 func TestPaymentChecker_SufficientPayment(t *testing.T) {
+	t.Parallel()
 	var (
 		payment int64 = 10
 		eq            = payment
-		gt      int64 = payment + 1
-		lt      int64 = payment - 1
+		gt            = payment + 1
+		lt            = payment - 1
 	)
 
 	testCases := []struct {
@@ -84,7 +87,7 @@ func TestPaymentChecker_SufficientPayment(t *testing.T) {
 				minJobPayment = &mjb
 			}
 
-			checker := fluxmonitorv2.NewPaymentChecker(assets.NewLink(tc.minContractPayment), minJobPayment)
+			checker := fluxmonitorv2.NewPaymentChecker(assets.NewLinkFromJuels(tc.minContractPayment), minJobPayment)
 
 			assert.Equal(t, tc.want, checker.SufficientPayment(big.NewInt(payment)))
 		})
